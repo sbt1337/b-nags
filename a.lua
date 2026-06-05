@@ -45,6 +45,7 @@ local State = {
     LastScan    = -Config["Scan Cooldown"],
     DeathCount  = 0,
     LastWebhook = Environment.RaidFarmLastWebhook or tick(),
+    InLobby     = false,
     HUD         = nil,
 }
 
@@ -100,6 +101,8 @@ do
     end
 
     function Farm.InLobby()
+        if State.InLobby then return true end
+        -- fallback attribute checks in case the remote fired before we hooked it
         if Client:GetAttribute("Spectating") == true then return true end
         local Char = Client.Character
         if Char and Char:GetAttribute("CurrentState") == "ArenaSpectator" then return true end
@@ -268,6 +271,22 @@ do
         end
     end)
 
+    -- Hook the spectate remote directly — server fires "allowSpectating" the moment
+    -- you hit the raid lobby, and "blockSpectating" when you leave it.
+    -- Much more reliable than polling attributes.
+    pcall(function()
+        local Control = ReplicatedStorage:WaitForChild("Remotes", 5)
+            :WaitForChild("Spectating", 5)
+            :WaitForChild("Control", 5)
+        Control.OnClientEvent:Connect(function(Action)
+            if Action == "allowSpectating" then
+                State.InLobby = true
+            elseif Action == "blockSpectating" then
+                State.InLobby = false
+            end
+        end)
+    end)
+
     Client.AncestryChanged:Connect(function()
         if not Client.Parent then
             Farm.WebhookDisconnect("kicked / removed from server")
@@ -315,6 +334,7 @@ Spawn(function()
                     HUD.Status.Text = Format("Joining %s", Found.WorldName)
                     Farm.Notify("Raid Farm", Format("Raid found in %s — teleporting", Found.WorldName), 6)
 
+                    State.InLobby = false
                     if not Farm.JoinServer(Found) then
                         Farm.Notify("Raid Farm", "Teleport failed — retrying", 4)
                     end
