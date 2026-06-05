@@ -1,353 +1,329 @@
--- Type Soul | Raid Farm
--- Scans all worlds for servers with active raids (Raid == true in server list),
--- joins them, then resets repeatedly until the server puts us in ArenaSpectator
--- (raid lobby). Once there, stays idle to stack Raid Points passively.
--- Does NOT interact with BossRaidNPC / instance boss fights — world raids only.
+local Game = game
 
-local Players         = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local VirtualUser     = game:GetService("VirtualUser")
-local RunService      = game:GetService("RunService")
+local NewInstance = Instance.new
+local NewVector2  = Vector2.new
+local NewRGB      = Color3.fromRGB
+local NewUDim2    = UDim2.new
+local NewUDim     = UDim.new
 
-local LocalPlayer = Players.LocalPlayer
+local HttpService       = Game:GetService("HttpService")
+local ReplicatedStorage = Game:GetService("ReplicatedStorage")
+local VirtualUser       = Game:GetService("VirtualUser")
+local Players           = Game:GetService("Players")
 
--- ─── Config ───────────────────────────────────────────────────────────────────
+local Spawn  = task.spawn
+local Wait   = task.wait
+local Delay  = task.delay
 
-local SCAN_COOLDOWN   = 30   -- seconds between server-list scans when no raid found
-local REJOIN_WAIT     = 20   -- seconds to wait after firing a teleport before scanning again
-local REQUEST_DELAY   = 0.4  -- delay between per-world requests to avoid throttle
-local RESET_WAIT      = 6    -- seconds to wait after each self-kill before checking state / killing again
+local Floor  = math.floor
+local Ceil   = math.ceil
+local Format = string.format
 
--- Worlds to search (same order the in-game server list uses)
-local Worlds = {
-    "Karakura Town",
-    "Hueco Mundo",
-    "Soul Society",
-    "Las Noches",
-    "Wandenreich City",
-    "Rukon District",
-    "Naruki City",
+local Client = Players.LocalPlayer
+
+-- Config
+
+local Config = {
+    ["Webhook URL"]   = "",   -- paste Discord webhook URL here
+    ["Scan Cooldown"] = 30,
+    ["Rejoin Wait"]   = 20,
+    ["Request Delay"] = 0.4,
+    ["Reset Wait"]    = 6,
 }
 
--- ─── Helpers ──────────────────────────────────────────────────────────────────
+local Worlds = {
+    "Karakura Town", "Hueco Mundo", "Soul Society",
+    "Las Noches", "Wandenreich City", "Rukon District", "Naruki City",
+}
 
-local function Notify(Title, Msg, Duration)
-    pcall(function()
-        game:GetService("StarterGui"):SetCore("SendNotification", {
-            Title    = Title,
-            Text     = Msg,
-            Duration = Duration or 6,
-        })
-    end)
-end
+-- State
 
-local function GetCharacter()
-    return LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-end
+local Farm  = {Connections = {}}
+local State = {
+    LastScan    = -Config["Scan Cooldown"],
+    DeathCount  = 0,
+    LastWebhook = tick(),
+    HUD         = nil,
+}
 
-local function IsInRaid()
-    local Ambience = workspace:FindFirstChild("Ambience")
-    return Ambience ~= nil and Ambience:GetAttribute("RaidActive") == true
-end
+-- Webhook
 
-local function GetRaidPoints()
-    local Char = LocalPlayer.Character
-    if not Char then return 0 end
-    return math.floor(Char:GetAttribute("RaidPoints") or 0)
-end
+do
+    function Farm.Webhook(Message)
+        if Config["Webhook URL"] == "" then return end
+        pcall(function()
+            request({
+                Url     = Config["Webhook URL"],
+                Method  = "POST",
+                Headers = {["Content-Type"] = "application/json"},
+                Body    = HttpService:JSONEncode({username = "Raid Farm", content = Message}),
+            })
+        end)
+    end
 
--- Returns true once the server has put us in the raid lobby / spectator state.
--- Two equivalent signals from the decompile:
---   character:GetAttribute("CurrentState") == "ArenaSpectator"  (ClientHandler.lua)
---   player:GetAttribute("Spectating") == true                   (Leaderboard.lua)
-local function IsInLobby()
-    if LocalPlayer:GetAttribute("Spectating") == true then return true end
-    local Char = LocalPlayer.Character
-    if Char and Char:GetAttribute("CurrentState") == "ArenaSpectator" then return true end
-    return false
-end
+    function Farm.WebhookRP()
+        local RP = Farm.GetRP()
+        Farm.Webhook(Format("**Raid Farm** — hourly update | RP: **%d**", RP))
+        State.LastWebhook = tick()
+    end
 
--- Kills the character instantly. The server will respawn us and track the death.
-local function ResetCharacter()
-    local Char = LocalPlayer.Character
-    if not Char then return end
-    local Humanoid = Char:FindFirstChildOfClass("Humanoid")
-    if Humanoid and Humanoid.Health > 0 then
-        Humanoid.Health = 0
+    function Farm.WebhookDisconnect(Reason)
+        Farm.Webhook(Format("**Raid Farm** — disconnected (%s) | Last RP: **%d**", Reason, Farm.GetRP()))
     end
 end
 
--- ─── AFK hooks ────────────────────────────────────────────────────────────────
+-- Helpers
 
--- Override the game's own AFK confirmation remote so the server never boots us.
--- The server invokes AfkPrompt.OnClientInvoke and boots the player if it returns
--- falsy or times out; returning true keeps us in.
-local function HookAfkPrompt()
-    local Requests = ReplicatedStorage:FindFirstChild("Requests")
-    if not Requests then return end
-    local Prompt = Requests:FindFirstChild("AfkPrompt")
-    if not Prompt then return end
-    Prompt.OnClientInvoke = function()
-        Notify("Raid Farm", "AFK check — confirmed!", 3)
+do
+    function Farm.Notify(Title, Msg, Duration)
+        pcall(function()
+            Game:GetService("StarterGui"):SetCore("SendNotification", {
+                Title = Title, Text = Msg, Duration = Duration or 6,
+            })
+        end)
+    end
+
+    function Farm.GetRP()
+        local Char = Client.Character
+        if not Char then return 0 end
+        return Floor(Char:GetAttribute("RaidPoints") or 0)
+    end
+
+    function Farm.InRaid()
+        local Ambience = workspace:FindFirstChild("Ambience")
+        return Ambience ~= nil and Ambience:GetAttribute("RaidActive") == true
+    end
+
+    function Farm.InLobby()
+        if Client:GetAttribute("Spectating") == true then return true end
+        local Char = Client.Character
+        if Char and Char:GetAttribute("CurrentState") == "ArenaSpectator" then return true end
+        return false
+    end
+
+    function Farm.ResetChar()
+        local Char = Client.Character
+        if not Char then return end
+        local Humanoid = Char:FindFirstChildOfClass("Humanoid")
+        if Humanoid and Humanoid.Health > 0 then
+            Humanoid.Health = 0
+        end
+    end
+
+    function Farm.HookAfk()
+        local Requests = ReplicatedStorage:FindFirstChild("Requests")
+        if not Requests then return end
+        local Prompt = Requests:FindFirstChild("AfkPrompt")
+        if not Prompt then return end
+        Prompt.OnClientInvoke = function() return true end
+    end
+end
+
+-- HUD
+
+do
+    function Farm.BuildHUD()
+        local Existing = Client.PlayerGui:FindFirstChild("RaidFarmHUD")
+        if Existing then Existing:Destroy() end
+
+        local Gui = NewInstance("ScreenGui")
+        Gui.Name            = "RaidFarmHUD"
+        Gui.ResetOnSpawn    = false
+        Gui.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
+        Gui.Parent          = Client.PlayerGui
+
+        local Frame = NewInstance("Frame")
+        Frame.Size                   = NewUDim2(0, 230, 0, 82)
+        Frame.Position               = NewUDim2(1, -240, 0, 10)
+        Frame.BackgroundColor3       = NewRGB(12, 12, 12)
+        Frame.BackgroundTransparency = 0.25
+        Frame.BorderSizePixel        = 0
+        Frame.Parent                 = Gui
+
+        local Corner = NewInstance("UICorner")
+        Corner.CornerRadius = NewUDim(0, 6)
+        Corner.Parent       = Frame
+
+        local function Label(Name, Y, Color)
+            local L = NewInstance("TextLabel")
+            L.Name                   = Name
+            L.Size                   = NewUDim2(1, -10, 0, 22)
+            L.Position               = NewUDim2(0, 8, 0, Y)
+            L.BackgroundTransparency = 1
+            L.TextColor3             = Color
+            L.Font                   = Enum.Font.GothamMedium
+            L.TextSize               = 13
+            L.TextXAlignment         = Enum.TextXAlignment.Left
+            L.Text                   = ""
+            L.Parent                 = Frame
+            return L
+        end
+
+        return {
+            Status = Label("Status", 4,  NewRGB(230, 230, 230)),
+            Phase  = Label("Phase",  28, NewRGB(180, 130, 255)),
+            Points = Label("Points", 54, NewRGB(255, 169, 108)),
+        }
+    end
+end
+
+-- Scanner
+
+do
+    function Farm.FindRaid(WorldName)
+        local Requests = ReplicatedStorage:FindFirstChild("Requests")
+        if not Requests then return nil end
+        local Remote = Requests:FindFirstChild("RequestServerList")
+        if not Remote then return nil end
+
+        local Ok, Response = pcall(function()
+            return Remote:InvokeServer(WorldName, true)
+        end)
+        if not Ok or type(Response) ~= "table" then return nil end
+
+        for _, Servers in next, Response do
+            if type(Servers) ~= "table" then continue end
+            for _, Data in next, Servers do
+                if type(Data) ~= "table" then continue end
+                if Data.Raid ~= true then continue end
+                if (Data.ServerPlayers or 0) >= (Data.ServerPlayerMax or 99) then continue end
+                return {
+                    WorldName  = WorldName,
+                    ServerName = Data.ServerName or "Unknown",
+                    JobID      = Data.JobID,
+                    ReservedId = Data.ReservedId,
+                }
+            end
+        end
+
+        return nil
+    end
+
+    function Farm.ScanWorlds()
+        for _, World in next, Worlds do
+            local Found = Farm.FindRaid(World)
+            if Found then return Found end
+            Wait(Config["Request Delay"])
+        end
+        return nil
+    end
+end
+
+-- Teleport
+
+do
+    function Farm.JoinServer(Info)
+        local Char = Client.Character or Client.CharacterAdded:Wait()
+
+        local Ok, Handler = pcall(function()
+            return Char:WaitForChild("CharacterHandler", 5)
+        end)
+        if not Ok or not Handler then return false end
+
+        local Ok2, Remotes = pcall(function()
+            return Handler:WaitForChild("Remotes", 5)
+        end)
+        if not Ok2 or not Remotes then return false end
+
+        local Teleport = Remotes:FindFirstChild("ServerListTeleport")
+        if not Teleport then return false end
+
+        Teleport:FireServer(Info.WorldName, Info.JobID, nil, Info.ReservedId)
         return true
     end
 end
 
--- Prevent Roblox's own 20-minute idle kick by simulating input when idle.
-LocalPlayer.Idled:Connect(function()
-    pcall(function()
-        VirtualUser:CaptureController()
-        VirtualUser:ClickButton2(Vector2.new())
-    end)
-end)
+-- Connections
 
--- Re-hook after each respawn in case CharacterAdded reloads ClientHandler scripts.
-LocalPlayer.CharacterAdded:Connect(function()
-    task.wait(2)
-    HookAfkPrompt()
-end)
-
--- ─── Server scanning ──────────────────────────────────────────────────────────
-
--- Calls RequestServerList for a single world and returns the first non-full server
--- that has Raid == true, or nil if none found.
-local function FindRaidInWorld(WorldName)
-    local Requests = ReplicatedStorage:FindFirstChild("Requests")
-    if not Requests then return nil end
-    local RequestServerList = Requests:FindFirstChild("RequestServerList")
-    if not RequestServerList then return nil end
-
-    local Ok, Response = pcall(function()
-        return RequestServerList:InvokeServer(WorldName, true)
+do
+    Client.Idled:Connect(function()
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(NewVector2())
+        end)
     end)
 
-    if not Ok or type(Response) ~= "table" then return nil end
-
-    for _, Servers in pairs(Response) do
-        if type(Servers) == "table" then
-            for _, ServerData in pairs(Servers) do
-                if type(ServerData) == "table"
-                    and ServerData.Raid == true
-                    and (ServerData.ServerPlayers or 0) < (ServerData.ServerPlayerMax or 99)
-                then
-                    return {
-                        WorldName   = WorldName,
-                        ServerName  = ServerData.ServerName  or "Unknown",
-                        JobID       = ServerData.JobID,
-                        ReservedId  = ServerData.ReservedId,
-                        PlayerCount = ServerData.ServerPlayers or 0,
-                    }
-                end
-            end
-        end
-    end
-
-    return nil
-end
-
--- Iterates all worlds and returns the first raid server found.
-local function ScanAllWorlds()
-    for _, WorldName in ipairs(Worlds) do
-        local Found = FindRaidInWorld(WorldName)
-        if Found then return Found end
-        task.wait(REQUEST_DELAY)
-    end
-    return nil
-end
-
--- ─── Teleport ─────────────────────────────────────────────────────────────────
-
-local function JoinRaidServer(ServerInfo)
-    local Char = GetCharacter()
-
-    local Ok, CharHandler = pcall(function()
-        return Char:WaitForChild("CharacterHandler", 5)
-    end)
-    if not Ok or not CharHandler then
-        warn("[RaidFarm] CharacterHandler not found")
-        return false
-    end
-
-    local Ok2, Remotes = pcall(function()
-        return CharHandler:WaitForChild("Remotes", 5)
-    end)
-    if not Ok2 or not Remotes then
-        warn("[RaidFarm] Remotes not found")
-        return false
-    end
-
-    local Teleport = Remotes:FindFirstChild("ServerListTeleport")
-    if not Teleport then
-        warn("[RaidFarm] ServerListTeleport remote not found")
-        return false
-    end
-
-    Teleport:FireServer(
-        ServerInfo.WorldName,
-        ServerInfo.JobID,
-        nil,
-        ServerInfo.ReservedId
-    )
-    return true
-end
-
--- ─── HUD ──────────────────────────────────────────────────────────────────────
-
-local function BuildHUD()
-    -- Remove any old instance
-    local Existing = LocalPlayer.PlayerGui:FindFirstChild("RaidFarmHUD")
-    if Existing then Existing:Destroy() end
-
-    local Gui    = Instance.new("ScreenGui")
-    Gui.Name     = "RaidFarmHUD"
-    Gui.ResetOnSpawn = false
-    Gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    Gui.Parent   = LocalPlayer.PlayerGui
-
-    local Frame  = Instance.new("Frame")
-    Frame.Size   = UDim2.new(0, 230, 0, 82)
-    Frame.Position = UDim2.new(1, -240, 0, 10)
-    Frame.BackgroundColor3 = Color3.fromRGB(12, 12, 12)
-    Frame.BackgroundTransparency = 0.25
-    Frame.BorderSizePixel = 0
-    Frame.Parent = Gui
-
-    local Corner = Instance.new("UICorner")
-    Corner.CornerRadius = UDim.new(0, 6)
-    Corner.Parent = Frame
-
-    local StatusLabel = Instance.new("TextLabel")
-    StatusLabel.Name  = "Status"
-    StatusLabel.Size  = UDim2.new(1, -10, 0, 22)
-    StatusLabel.Position = UDim2.new(0, 8, 0, 4)
-    StatusLabel.BackgroundTransparency = 1
-    StatusLabel.TextColor3 = Color3.fromRGB(230, 230, 230)
-    StatusLabel.Font = Enum.Font.GothamMedium
-    StatusLabel.TextSize = 13
-    StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-    StatusLabel.Text = "⚙  Raid Farm — Starting"
-    StatusLabel.Parent = Frame
-
-    local PhaseLabel = Instance.new("TextLabel")
-    PhaseLabel.Name  = "Phase"
-    PhaseLabel.Size  = UDim2.new(1, -10, 0, 22)
-    PhaseLabel.Position = UDim2.new(0, 8, 0, 28)
-    PhaseLabel.BackgroundTransparency = 1
-    PhaseLabel.TextColor3 = Color3.fromRGB(180, 130, 255)
-    PhaseLabel.Font = Enum.Font.GothamMedium
-    PhaseLabel.TextSize = 13
-    PhaseLabel.TextXAlignment = Enum.TextXAlignment.Left
-    PhaseLabel.Text = ""
-    PhaseLabel.Parent = Frame
-
-    local PointsLabel = Instance.new("TextLabel")
-    PointsLabel.Name  = "Points"
-    PointsLabel.Size  = UDim2.new(1, -10, 0, 22)
-    PointsLabel.Position = UDim2.new(0, 8, 0, 54)
-    PointsLabel.BackgroundTransparency = 1
-    PointsLabel.TextColor3 = Color3.fromRGB(255, 169, 108)
-    PointsLabel.Font = Enum.Font.GothamMedium
-    PointsLabel.TextSize = 13
-    PointsLabel.TextXAlignment = Enum.TextXAlignment.Left
-    PointsLabel.Text = "RP: 0"
-    PointsLabel.Parent = Frame
-
-    return {
-        Status = StatusLabel,
-        Phase  = PhaseLabel,
-        Points = PointsLabel,
-    }
-end
-
--- ─── Main loop ────────────────────────────────────────────────────────────────
-
-local function Main()
-    HookAfkPrompt()
-
-    local HUD = BuildHUD()
-
-    -- Rebuild HUD on respawn (ResetOnSpawn = false keeps it alive, but just in case)
-    LocalPlayer.CharacterAdded:Connect(function()
-        task.wait(2)
-        HookAfkPrompt()
-        -- HUD persists (ResetOnSpawn = false), only rebuild if destroyed
-        if not LocalPlayer.PlayerGui:FindFirstChild("RaidFarmHUD") then
-            HUD = BuildHUD()
+    Client.CharacterAdded:Connect(function()
+        Wait(2)
+        Farm.HookAfk()
+        if not Client.PlayerGui:FindFirstChild("RaidFarmHUD") then
+            State.HUD = Farm.BuildHUD()
         end
     end)
 
-    Notify("Raid Farm", "Started — scanning for raids...", 5)
+    Client.AncestryChanged:Connect(function()
+        if not Client.Parent then
+            Farm.WebhookDisconnect("kicked / removed from server")
+        end
+    end)
 
-    local LastScan  = -SCAN_COOLDOWN  -- force immediate first scan
-    local DeathCount = 0
+    Game.Close:Connect(function()
+        Farm.WebhookDisconnect("game closed")
+    end)
+end
+
+-- Main
+
+Spawn(function()
+    Farm.HookAfk()
+    State.HUD = Farm.BuildHUD()
+    State.HUD.Status.Text = "Raid Farm — starting"
+    Farm.Notify("Raid Farm", "Started — scanning for raids", 5)
 
     while true do
-        task.wait(1)
+        Wait(1)
 
-        -- Always update RP display
-        HUD.Points.Text = "RP: " .. GetRaidPoints()
+        local HUD = State.HUD
+        HUD.Points.Text = Format("RP: %d", Farm.GetRP())
 
-        -- ── Phase 1: not in a raid at all → find one ─────────────────────────
-        if not IsInRaid() then
-            DeathCount = 0
-            local TimeUntil = math.ceil(SCAN_COOLDOWN - (tick() - LastScan))
+        if tick() - State.LastWebhook >= 3600 then
+            Farm.WebhookRP()
+        end
 
-            if TimeUntil > 0 then
-                HUD.Status.Text = ("🔍  Scan in %ds"):format(TimeUntil)
+        if not Farm.InRaid() then
+            State.DeathCount = 0
+            local TimeLeft = Ceil(Config["Scan Cooldown"] - (tick() - State.LastScan))
+
+            if TimeLeft > 0 then
+                HUD.Status.Text = Format("Scan in %ds", TimeLeft)
                 HUD.Phase.Text  = ""
             else
-                HUD.Status.Text = "🔍  Scanning worlds..."
+                HUD.Status.Text = "Scanning worlds..."
                 HUD.Phase.Text  = ""
-                LastScan = tick()
+                State.LastScan  = tick()
 
-                local Found = ScanAllWorlds()
+                local Found = Farm.ScanWorlds()
 
                 if Found then
-                    HUD.Status.Text = ("✈  Joining %s"):format(Found.WorldName)
-                    Notify(
-                        "Raid Farm",
-                        ("Raid found in %s (%s) — teleporting!"):format(Found.WorldName, Found.ServerName),
-                        6
-                    )
-                    local Ok = JoinRaidServer(Found)
-                    if Ok then
-                        task.wait(REJOIN_WAIT)
-                    else
-                        Notify("Raid Farm", "Teleport failed — retrying next scan", 4)
+                    HUD.Status.Text = Format("Joining %s", Found.WorldName)
+                    Farm.Notify("Raid Farm", Format("Raid found in %s — teleporting", Found.WorldName), 6)
+
+                    if not Farm.JoinServer(Found) then
+                        Farm.Notify("Raid Farm", "Teleport failed — retrying", 4)
                     end
-                    LastScan = tick()
+
+                    Wait(Config["Rejoin Wait"])
+                    State.LastScan = tick()
                 else
-                    HUD.Status.Text = ("❌  No raid (retry in %ds)"):format(SCAN_COOLDOWN)
-                    Notify("Raid Farm", "No active raid servers found — retrying in " .. SCAN_COOLDOWN .. "s", 4)
+                    HUD.Status.Text = Format("No raid (retry in %ds)", Config["Scan Cooldown"])
                 end
             end
 
-        -- ── Phase 2: in a raid, already in lobby → idle and farm ─────────────
-        elseif IsInLobby() then
-            HUD.Status.Text = "💤  Lobby — farming RP"
-            HUD.Phase.Text  = ("Deaths to get here: %d"):format(DeathCount)
-            -- deliberately NOT touching LastScan here — when the raid ends and
-            -- we fall into Phase 1, the cooldown will have naturally elapsed
-            -- (raid lasts minutes, cooldown is 30s) so we scan immediately.
+        elseif Farm.InLobby() then
+            HUD.Status.Text = "Lobby — farming RP"
+            HUD.Phase.Text  = Format("Deaths: %d", State.DeathCount)
 
-        -- ── Phase 3: in a raid but NOT yet in lobby → keep resetting ─────────
         else
-            DeathCount += 1
-            HUD.Status.Text = "🔄  Getting to lobby..."
-            HUD.Phase.Text  = ("Reset #%d — waiting for ArenaSpectator"):format(DeathCount)
+            State.DeathCount += 1
+            HUD.Status.Text = "Getting to lobby..."
+            HUD.Phase.Text  = Format("Reset #%d", State.DeathCount)
 
-            if DeathCount == 1 then
-                Notify("Raid Farm", "In raid — resetting to reach lobby...", 4)
+            if State.DeathCount == 1 then
+                Farm.Notify("Raid Farm", "In raid — resetting to lobby", 4)
             end
 
-            ResetCharacter()
-
-            -- Wait for the respawn + server state update before looping again.
-            -- If the server is going to flip us to ArenaSpectator it does so on
-            -- (or shortly after) the death that hits the threshold.
-            task.wait(RESET_WAIT)
+            Farm.ResetChar()
+            Wait(Config["Reset Wait"])
         end
     end
-end
-
-task.spawn(Main)
+end)
