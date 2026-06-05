@@ -47,14 +47,15 @@ local Worlds = {
 
 local Farm  = {Connections = {}}
 local State = {
-    LastScan    = -Config["Scan Cooldown"],
-    DeathCount  = 0,
-    LastWebhook = Environment.RaidFarmLastWebhook or tick(),
-    InLobby     = false,
-    WasInRaid   = false,
-    RaidEndedAt = 0,
-    LastJobID   = nil,
-    HUD         = nil,
+    LastScan      = -Config["Scan Cooldown"],
+    DeathCount    = 0,
+    LastWebhook   = Environment.RaidFarmLastWebhook or tick(),
+    InLobby       = false,
+    WasInRaid     = false,
+    RaidEndedAt   = 0,
+    RaidEnteredAt = 0,
+    LastJobID     = nil,
+    HUD           = nil,
 }
 
 -- blacklist persists across reconnects via getgenv
@@ -382,6 +383,11 @@ Spawn(function()
 
         local NowInRaid = Farm.InRaid()
 
+        -- detect raid-started transition (track when we first entered)
+        if not State.WasInRaid and NowInRaid then
+            State.RaidEnteredAt = tick()
+        end
+
         -- detect raid-ended transition, give character time to leave ArenaSpectator
         if State.WasInRaid and not NowInRaid then
             State.RaidEndedAt = tick()
@@ -396,7 +402,31 @@ Spawn(function()
         end
         State.WasInRaid = NowInRaid
 
-        if not NowInRaid then
+        -- stuck-raid escape: timer at 00:00 but RaidActive never cleared
+        -- bail after 12 minutes in-raid (well past any real raid timer)
+        local StuckRaid = NowInRaid and State.RaidEnteredAt > 0 and (tick() - State.RaidEnteredAt) > 720
+        if StuckRaid then
+            HUD.Status.Text = "Stuck raid — leaving"
+            HUD.Phase.Text  = "blacklisting & scanning"
+            local CurrentJob = Game.JobId
+            if CurrentJob and CurrentJob ~= "" then
+                Blacklist[CurrentJob] = tick()
+            end
+            State.RaidEnteredAt = 0
+            Farm.Webhook(Format("**Stuck raid detected** (>12min) — bailing | RP: **%d**", Farm.GetRP()))
+
+            -- try to jump straight into a new raid; fall back to fresh reconnect
+            local Escape = Farm.ScanWorlds()
+            if Escape then
+                HUD.Status.Text = Format("Escaping to %s", Escape.WorldName)
+                Farm.JoinServer(Escape)
+            else
+                -- no live raid found, just teleport out of this dead server
+                local PlaceId = Game.PlaceId
+                pcall(function() TeleportService:Teleport(PlaceId, Client) end)
+            end
+            Wait(Config["Rejoin Wait"])
+        elseif not NowInRaid then
             State.DeathCount = 0
 
             local PostRaidWait = 8 - (tick() - State.RaidEndedAt)
