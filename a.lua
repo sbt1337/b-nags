@@ -53,8 +53,15 @@ local State = {
     InLobby     = false,
     WasInRaid   = false,
     RaidEndedAt = 0,
+    LastJobID   = nil,
     HUD         = nil,
 }
+
+-- blacklist persists across reconnects via getgenv
+if not Environment.RaidFarmBlacklist then
+    Environment.RaidFarmBlacklist = {}
+end
+local Blacklist = Environment.RaidFarmBlacklist
 
 -- Webhook
 
@@ -202,6 +209,8 @@ do
                 if type(Data) ~= "table" then continue end
                 if Data.Raid ~= true then continue end
                 if (Data.ServerPlayers or 0) >= (Data.ServerPlayerMax or 99) then continue end
+                local JobID = Data.JobID
+                if Blacklist[JobID] and tick() - Blacklist[JobID] < 300 then continue end
                 return {
                     WorldName  = WorldName,
                     ServerName = Data.ServerName or "Unknown",
@@ -260,6 +269,8 @@ do
 
         HUD.Phase.Text = "firing teleport..."
         Farm.Webhook(Format("**Teleporting** → %s (job: %s)", Info.WorldName, tostring(Info.JobID)))
+        State.LastJobID             = Info.JobID
+        Environment.RaidFarmLastJob = Info.JobID
         Teleport:FireServer(Info.WorldName, Info.JobID, nil, Info.ReservedId)
         return true
     end
@@ -328,6 +339,13 @@ do
                 if SFind(Reason, "Client initiated disconnect.", 1, true) then return end
                 if SFind(Reason, "Reconnect was unsuccessful.", 1, true) then return end
                 if SFind(Reason, "Same account launched experience from different device.", 1, true) then return end
+
+                -- blacklist the last attempted job so we don't re-join a dead server
+                local FailedJob = Environment.RaidFarmLastJob
+                if FailedJob then
+                    Blacklist[FailedJob] = tick()
+                    Environment.RaidFarmLastJob = nil
+                end
 
                 Farm.WebhookDisconnect(Reason)
 
