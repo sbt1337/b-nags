@@ -51,6 +51,8 @@ local State = {
     DeathCount  = 0,
     LastWebhook = Environment.RaidFarmLastWebhook or tick(),
     InLobby     = false,
+    WasInRaid   = false,
+    RaidEndedAt = 0,
     HUD         = nil,
 }
 
@@ -226,21 +228,34 @@ end
 
 do
     function Farm.JoinServer(Info)
+        local HUD = State.HUD
         local Char = Client.Character or Client.CharacterAdded:Wait()
 
+        HUD.Phase.Text = "finding CharacterHandler..."
         local Ok, Handler = pcall(function()
-            return Char:WaitForChild("CharacterHandler", 5)
+            return Char:WaitForChild("CharacterHandler", 8)
         end)
-        if not Ok or not Handler then return false end
+        if not Ok or not Handler then
+            HUD.Phase.Text = "CharacterHandler missing"
+            return false
+        end
 
+        HUD.Phase.Text = "finding Remotes..."
         local Ok2, Remotes = pcall(function()
-            return Handler:WaitForChild("Remotes", 5)
+            return Handler:WaitForChild("Remotes", 8)
         end)
-        if not Ok2 or not Remotes then return false end
+        if not Ok2 or not Remotes then
+            HUD.Phase.Text = "Remotes missing"
+            return false
+        end
 
         local Teleport = Remotes:FindFirstChild("ServerListTeleport")
-        if not Teleport then return false end
+        if not Teleport then
+            HUD.Phase.Text = "ServerListTeleport missing"
+            return false
+        end
 
+        HUD.Phase.Text = "firing teleport..."
         Teleport:FireServer(Info.WorldName, Info.JobID, nil, Info.ReservedId)
         return true
     end
@@ -343,34 +358,50 @@ Spawn(function()
             Farm.WebhookRP()
         end
 
-        if not Farm.InRaid() then
+        local NowInRaid = Farm.InRaid()
+
+        -- detect raid-ended transition, give character time to leave ArenaSpectator
+        if State.WasInRaid and not NowInRaid then
+            State.RaidEndedAt = tick()
+            State.InLobby     = false
+            State.DeathCount  = 0
+        end
+        State.WasInRaid = NowInRaid
+
+        if not NowInRaid then
             State.DeathCount = 0
-            local TimeLeft = Ceil(Config["Scan Cooldown"] - (tick() - State.LastScan))
 
-            if TimeLeft > 0 then
-                HUD.Status.Text = Format("Scan in %ds", TimeLeft)
-                HUD.Phase.Text  = ""
+            local PostRaidWait = 8 - (tick() - State.RaidEndedAt)
+            if PostRaidWait > 0 then
+                HUD.Status.Text = Format("Raid ended — waiting %ds", Ceil(PostRaidWait))
+                HUD.Phase.Text  = "letting character reset..."
             else
-                HUD.Status.Text = "Scanning worlds..."
-                HUD.Phase.Text  = ""
-                State.LastScan  = tick()
+                local TimeLeft = Ceil(Config["Scan Cooldown"] - (tick() - State.LastScan))
 
-                local Found = Farm.ScanWorlds()
-
-                if Found then
-                    HUD.Status.Text = Format("Joining %s", Found.WorldName)
-                    Farm.Notify("Raid Farm", Format("Raid found in %s — teleporting", Found.WorldName), 6)
-
-                    State.InLobby = false
-                    if not Farm.JoinServer(Found) then
-                        Farm.Notify("Raid Farm", "Teleport failed — retrying", 4)
-                    end
-
-                    Wait(Config["Rejoin Wait"])
-                    -- if we never landed in a raid (server was full / rejected), scan immediately
-                    State.LastScan = Farm.InRaid() and tick() or -Config["Scan Cooldown"]
+                if TimeLeft > 0 then
+                    HUD.Status.Text = Format("Scan in %ds", TimeLeft)
+                    HUD.Phase.Text  = ""
                 else
-                    HUD.Status.Text = Format("No raid (retry in %ds)", Config["Scan Cooldown"])
+                    HUD.Status.Text = "Scanning worlds..."
+                    HUD.Phase.Text  = ""
+                    State.LastScan  = tick()
+
+                    local Found = Farm.ScanWorlds()
+
+                    if Found then
+                        HUD.Status.Text = Format("Joining %s", Found.WorldName)
+                        Farm.Notify("Raid Farm", Format("Raid found in %s — teleporting", Found.WorldName), 6)
+
+                        State.InLobby = false
+                        if not Farm.JoinServer(Found) then
+                            Farm.Notify("Raid Farm", "Teleport failed — retrying", 4)
+                        end
+
+                        Wait(Config["Rejoin Wait"])
+                        State.LastScan = Farm.InRaid() and tick() or -Config["Scan Cooldown"]
+                    else
+                        HUD.Status.Text = Format("No raid (retry in %ds)", Config["Scan Cooldown"])
+                    end
                 end
             end
 
