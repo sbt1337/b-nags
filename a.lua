@@ -1,4 +1,5 @@
-local Game = game
+local Game        = game
+local Environment = getgenv()
 
 local NewInstance = Instance.new
 local NewVector2  = Vector2.new
@@ -22,9 +23,11 @@ local Format = string.format
 local Client = Players.LocalPlayer
 
 -- Config
+-- Set your webhook once in console: getgenv().RaidFarmWebhook = "https://discord.com/api/webhooks/..."
+-- It persists across server hops so you never have to set it again this session.
 
 local Config = {
-    ["Webhook URL"]   = "",   -- paste Discord webhook URL here
+    ["Webhook URL"]   = Environment.RaidFarmWebhook or "",
     ["Scan Cooldown"] = 30,
     ["Rejoin Wait"]   = 20,
     ["Request Delay"] = 0.4,
@@ -41,7 +44,7 @@ local Farm  = {Connections = {}}
 local State = {
     LastScan    = -Config["Scan Cooldown"],
     DeathCount  = 0,
-    LastWebhook = tick(),
+    LastWebhook = Environment.RaidFarmLastWebhook or tick(),
     HUD         = nil,
 }
 
@@ -66,6 +69,7 @@ do
         local RP = Farm.GetRP()
         Farm.Webhook(Format("**Raid Farm** — hourly update | RP: **%d**", RP))
         State.LastWebhook = tick()
+        Environment.RaidFarmLastWebhook = State.LastWebhook
     end
 
     function Farm.WebhookDisconnect(Reason)
