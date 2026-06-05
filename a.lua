@@ -241,11 +241,23 @@ end
 -- Connections
 
 do
+    -- Idled event (fires after 20min idle)
     Client.Idled:Connect(function()
         pcall(function()
             VirtualUser:CaptureController()
             VirtualUser:ClickButton2(NewVector2())
         end)
+    end)
+
+    -- Periodic anti-afk loop — Delta mobile won't always fire Idled reliably
+    Spawn(function()
+        while true do
+            Wait(60)
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(NewVector2())
+            end)
+        end
     end)
 
     Client.CharacterAdded:Connect(function()
@@ -308,7 +320,8 @@ Spawn(function()
                     end
 
                     Wait(Config["Rejoin Wait"])
-                    State.LastScan = tick()
+                    -- if we never landed in a raid (server was full / rejected), scan immediately
+                    State.LastScan = Farm.InRaid() and tick() or -Config["Scan Cooldown"]
                 else
                     HUD.Status.Text = Format("No raid (retry in %ds)", Config["Scan Cooldown"])
                 end
