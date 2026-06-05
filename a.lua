@@ -32,8 +32,7 @@ local Config = {
 }
 
 local Worlds = {
-    "Karakura Town", "Hueco Mundo", "Soul Society",
-    "Las Noches", "Wandenreich City", "Rukon District", "Naruki City",
+    "Hueco Mundo",
 }
 
 -- State
