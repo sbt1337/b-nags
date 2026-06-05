@@ -237,6 +237,7 @@ do
         end)
         if not Ok or not Handler then
             HUD.Phase.Text = "CharacterHandler missing"
+            Farm.Webhook("**JoinServer failed** — CharacterHandler missing")
             return false
         end
 
@@ -246,16 +247,19 @@ do
         end)
         if not Ok2 or not Remotes then
             HUD.Phase.Text = "Remotes missing"
+            Farm.Webhook("**JoinServer failed** — Remotes missing")
             return false
         end
 
         local Teleport = Remotes:FindFirstChild("ServerListTeleport")
         if not Teleport then
             HUD.Phase.Text = "ServerListTeleport missing"
+            Farm.Webhook("**JoinServer failed** — ServerListTeleport remote missing")
             return false
         end
 
         HUD.Phase.Text = "firing teleport..."
+        Farm.Webhook(Format("**Teleporting** → %s (job: %s)", Info.WorldName, tostring(Info.JobID)))
         Teleport:FireServer(Info.WorldName, Info.JobID, nil, Info.ReservedId)
         return true
     end
@@ -365,6 +369,7 @@ Spawn(function()
             State.RaidEndedAt = tick()
             State.InLobby     = false
             State.DeathCount  = 0
+            Farm.Webhook(Format("**Raid ended** — RP so far: **%d** | waiting 8s then scanning", Farm.GetRP()))
         end
         State.WasInRaid = NowInRaid
 
