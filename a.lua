@@ -1,6 +1,9 @@
 local Game        = game
 local Environment = getgenv()
 
+local GetPropertyChangedSignal = Game.GetPropertyChangedSignal
+local SFind = string.find
+
 local NewInstance = Instance.new
 local NewVector2  = Vector2.new
 local NewRGB      = Color3.fromRGB
@@ -9,8 +12,10 @@ local NewUDim     = UDim.new
 
 local HttpService       = Game:GetService("HttpService")
 local ReplicatedStorage = Game:GetService("ReplicatedStorage")
+local TeleportService   = Game:GetService("TeleportService")
 local VirtualUser       = Game:GetService("VirtualUser")
 local Players           = Game:GetService("Players")
+local CoreGui           = Game:GetService("CoreGui")
 
 local Spawn  = task.spawn
 local Wait   = task.wait
@@ -287,14 +292,36 @@ do
         end)
     end)
 
-    Client.AncestryChanged:Connect(function()
-        if not Client.Parent then
-            Farm.WebhookDisconnect("kicked / removed from server")
-        end
-    end)
+    -- Reconnect: watch the Roblox kick popup, same pattern as atmfarm
+    Spawn(function()
+        local Ok, Overlay = pcall(function()
+            return CoreGui:WaitForChild("RobloxPromptGui", 30)
+                         :WaitForChild("promptOverlay", 30)
+        end)
+        if not Ok or not Overlay then return end
 
-    Game.Close:Connect(function()
-        Farm.WebhookDisconnect("game closed")
+        Overlay.DescendantAdded:Connect(function(Desc)
+            if Desc.ClassName ~= "TextLabel" or Desc.Name ~= "ErrorMessage" then return end
+
+            GetPropertyChangedSignal(Desc, "Text"):Connect(function()
+                local Reason = Desc.Text
+                if Reason == "" then return end
+                if SFind(Reason, "Client initiated disconnect.", 1, true) then return end
+                if SFind(Reason, "Reconnect was unsuccessful.", 1, true) then return end
+                if SFind(Reason, "Same account launched experience from different device.", 1, true) then return end
+
+                Farm.WebhookDisconnect(Reason)
+
+                local PlaceId = Game.PlaceId
+                while true do
+                    local Success = pcall(function()
+                        TeleportService:Teleport(PlaceId, Client)
+                    end)
+                    if Success then break end
+                    Wait(3)
+                end
+            end)
+        end)
     end)
 end
 
