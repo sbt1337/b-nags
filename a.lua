@@ -387,6 +387,11 @@ Spawn(function()
             State.RaidEndedAt = tick()
             State.InLobby     = false
             State.DeathCount  = 0
+            -- blacklist this server so scanner doesn't re-join the same job
+            local CurrentJob = Game.JobId
+            if CurrentJob and CurrentJob ~= "" then
+                Blacklist[CurrentJob] = tick()
+            end
             Farm.Webhook(Format("**Raid ended** — RP so far: **%d** | waiting 8s then scanning", Farm.GetRP()))
         end
         State.WasInRaid = NowInRaid
