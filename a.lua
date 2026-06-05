@@ -27,7 +27,7 @@ local Client = Players.LocalPlayer
 -- It persists across server hops so you never have to set it again this session.
 
 local Config = {
-    ["Webhook URL"]   = Environment.RaidFarmWebhook or "",
+    ["Webhook URL"]   = Environment.RaidFarmWebhook or "https://discord.com/api/webhooks/1512584732637008114/0MAYEUOe1lKr4PrhZoUQ4FY1MtjcztnLOtVutuSPvHDlqMfOSa7HwpkOx6Rp8RydYxQC",
     ["Scan Cooldown"] = 30,
     ["Rejoin Wait"]   = 20,
     ["Request Delay"] = 0.4,
