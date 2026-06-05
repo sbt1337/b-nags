@@ -48,16 +48,18 @@ local State = {
 -- Webhook
 
 do
+    local HttpRequest = request or syn and syn.request or http_request or (HttpService and function(t)
+        HttpService:RequestAsync(t)
+    end) or nil
+
     function Farm.Webhook(Message)
-        if Config["Webhook URL"] == "" then return end
-        pcall(function()
-            request({
-                Url     = Config["Webhook URL"],
-                Method  = "POST",
-                Headers = {["Content-Type"] = "application/json"},
-                Body    = HttpService:JSONEncode({username = "Raid Farm", content = Message}),
-            })
-        end)
+        if Config["Webhook URL"] == "" or not HttpRequest then return end
+        pcall(HttpRequest, {
+            Url     = Config["Webhook URL"],
+            Method  = "POST",
+            Headers = {["Content-Type"] = "application/json"},
+            Body    = HttpService:JSONEncode({username = "Raid Farm", content = Message}),
+        })
     end
 
     function Farm.WebhookRP()
