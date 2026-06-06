@@ -794,6 +794,33 @@ end
 -- Main
 
 Spawn(function()
+    -- wait for the game to finish loading before touching anything
+    if not Game:IsLoaded() then
+        Game.Loaded:Wait()
+    end
+
+    -- wait for a character that's actually alive — loading screen / initial spawn
+    -- can leave the character in a dead or nil state
+    local Char = Client.Character
+    if not Char then
+        Char = Client.CharacterAdded:Wait()
+    end
+
+    local Hum = Char:WaitForChild("Humanoid", 15)
+    if Hum then
+        local Deadline = tick() + 20
+        while Hum.Health <= 0 and tick() < Deadline do
+            Wait(0.5)
+            -- character might have been replaced by a new one
+            Char = Client.Character or Char
+            Hum  = Char:FindFirstChildOfClass("Humanoid") or Hum
+        end
+    end
+
+    -- CharacterHandler being present means the game has finished initialising
+    -- this character server-side; without this the remotes don't exist yet
+    Char:WaitForChild("CharacterHandler", 30)
+
     Farm.HookAfk()
     State.HUD = Farm.BuildHUD()
     State.HUD.Status.Text = "Raid Farm — starting"
