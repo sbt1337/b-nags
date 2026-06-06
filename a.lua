@@ -38,7 +38,7 @@ local Config = {
     ["Scan Cooldown"] = 30,
     ["Rejoin Wait"]   = 20,
     ["Request Delay"] = 0.4,
-    ["Reset Wait"]    = 6,
+    ["Reset Wait"]    = 2,   -- post-respawn buffer; the real wait is inside Farm.ResetChar()
     -- Code Redeemer — fill in via getgenv() so they survive server hops:
     --   getgenv().RaidFarmDiscordToken = "YOUR_TOKEN"   (self-bot: raw token from browser devtools)
     --   getgenv().RaidFarmCodesChannel = "CHANNEL_ID"   (right-click channel → Copy Channel ID)
@@ -215,8 +215,27 @@ do
         if not Char then return end
         local Humanoid = Char:FindFirstChildOfClass("Humanoid")
         if not Humanoid or Humanoid.Health <= 0 then return end
+
         Farm.DeathEffect()
+
+        -- connect BEFORE killing so we can't miss the event if respawn is instant
+        local Spawned = false
+        local Conn = Client.CharacterAdded:Connect(function()
+            Spawned = true
+        end)
+
         Humanoid.Health = 0
+
+        -- respawn timer is server-controlled; block until the new character arrives
+        local Deadline = tick() + 20
+        while not Spawned and tick() < Deadline do
+            Wait(0.5)
+        end
+        Conn:Disconnect()
+
+        -- let CharacterHandler and remotes finish loading before the main loop
+        -- checks InLobby or tries to reset again
+        Wait(1.5)
     end
 
     function Farm.HookAfk()
@@ -760,20 +779,46 @@ Spawn(function()
             end
 
         elseif Farm.InLobby() then
+            State.DeathCount = 0   -- made it in; clear so next raid entry starts from 1
             HUD.Status.Text = "Lobby — farming RP"
-            HUD.Phase.Text  = Format("Deaths: %d", State.DeathCount)
+            HUD.Phase.Text  = ""
 
         else
             State.DeathCount += 1
-            HUD.Status.Text = "Getting to lobby..."
-            HUD.Phase.Text  = Format("Reset #%d", State.DeathCount)
 
-            if State.DeathCount == 1 then
-                Farm.Notify("Raid Farm", "In raid — resetting to lobby", 4)
+            -- 5 resets and still not spectating = bugged lobby, get out
+            if State.DeathCount > 5 then
+                State.DeathCount = 0
+                HUD.Status.Text = "Bugged lobby — bailing"
+                HUD.Phase.Text  = ""
+                Farm.Webhook(Format(
+                    "**Bugged lobby** (5 resets, never reached ArenaSpectator) — hopping | RP: **%d**",
+                    Farm.GetRP()
+                ))
+                Farm.Notify("Raid Farm", "Bugged lobby after 5 resets — server hopping", 6)
+
+                local Escape = Farm.ScanWorlds()
+                if Escape then
+                    HUD.Status.Text = Format("Hopping to %s", Escape.WorldName)
+                    if Farm.JoinServer(Escape) then
+                        Blacklist[Escape.JobID] = tick()
+                    end
+                else
+                    local PlaceId = Game.PlaceId
+                    pcall(function() TeleportService:Teleport(PlaceId, Client) end)
+                end
+                Wait(Config["Rejoin Wait"])
+            else
+                HUD.Status.Text = "Getting to lobby..."
+                HUD.Phase.Text  = Format("Reset #%d / 5", State.DeathCount)
+
+                if State.DeathCount == 1 then
+                    Farm.Notify("Raid Farm", "In raid — resetting to lobby", 4)
+                end
+
+                Farm.ResetChar()
+                Wait(Config["Reset Wait"])
             end
-
-            Farm.ResetChar()
-            Wait(Config["Reset Wait"])
         end
     end
 end)
