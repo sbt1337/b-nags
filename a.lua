@@ -444,6 +444,20 @@ do
         local HUD = State.HUD
         local Char = Client.Character or Client.CharacterAdded:Wait()
 
+        -- server silently rejects ServerListTeleport if the character is dead —
+        -- wait until health > 0 before attempting anything
+        local Hum = Char:FindFirstChildOfClass("Humanoid")
+        if Hum and Hum.Health <= 0 then
+            HUD.Phase.Text = "waiting to respawn..."
+            local Deadline = tick() + 20
+            while tick() < Deadline do
+                Char = Client.Character or Char
+                Hum  = Char:FindFirstChildOfClass("Humanoid") or Hum
+                if Hum.Health > 0 then break end
+                Wait(0.5)
+            end
+        end
+
         HUD.Phase.Text = "finding CharacterHandler..."
         local Ok, Handler = pcall(function()
             return Char:WaitForChild("CharacterHandler", 8)
@@ -897,24 +911,25 @@ Spawn(function()
 
             -- 5 resets and still not spectating = bugged lobby, get out
             if State.DeathCount > 5 then
-                State.DeathCount = 0
-                HUD.Status.Text = "Bugged lobby — bailing"
+                -- hold at 5 so if the teleport stalls and we're somehow still here,
+                -- the next tick bails again immediately instead of resetting to #1/5
+                State.DeathCount = 5
+                HUD.Status.Text = "Bugged lobby — escaping"
                 HUD.Phase.Text  = ""
+                Farm.Blacklist(Game.JobId)
                 Farm.Webhook(Format(
-                    "**Bugged lobby** (5 resets, never reached ArenaSpectator) — hopping | RP: **%d**",
+                    "**Bugged lobby** (5 resets, never reached ArenaSpectator) — teleporting out | RP: **%d**",
                     Farm.GetRP()
                 ))
-                Farm.Notify("Raid Farm", "Bugged lobby after 5 resets — server hopping", 6)
+                Farm.Notify("Raid Farm", "Bugged lobby after 5 resets — escaping", 6)
 
-                local Escape = Farm.ScanWorlds()
-                if Escape then
-                    HUD.Status.Text = Format("Hopping to %s", Escape.WorldName)
-                    if Farm.JoinServer(Escape) then
-                        Farm.Blacklist(Escape.JobID)
-                    end
-                else
-                    local PlaceId = Game.PlaceId
-                    pcall(function() TeleportService:Teleport(PlaceId, Client) end)
+                -- ServerListTeleport is blocked server-side when inside an active raid;
+                -- use TeleportService directly — it's engine-level and can't be rejected
+                local PlaceId = Game.PlaceId
+                while true do
+                    local Ok = pcall(function() TeleportService:Teleport(PlaceId, Client) end)
+                    if Ok then break end
+                    Wait(3)
                 end
                 Wait(Config["Rejoin Wait"])
             else
