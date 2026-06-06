@@ -49,7 +49,8 @@ local Worlds = {
 
 local Farm  = {Connections = {}}
 local State = {
-    LastScan      = -Config["Scan Cooldown"],
+    -- start 30s behind so the first scan has a full cooldown on fresh injection/reconnect
+    LastScan      = tick() - Config["Scan Cooldown"] + 30,
     DeathCount    = 0,
     LastWebhook   = Environment.RaidFarmLastWebhook or tick(),
     InLobby       = false,
@@ -476,6 +477,12 @@ do
 
                 Farm.WebhookDisconnect(Reason)
 
+                -- Wait before reconnecting: on Delta mobile, TeleportService:Teleport()
+                -- wipes getgenv() so the blacklist is gone on the next run. A delay here
+                -- + the 30s startup scan delay = ~90s gap, enough for most dead servers
+                -- to fall off the TS server list before the script scans again.
+                Wait(60)
+
                 local PlaceId = Game.PlaceId
                 while true do
                     local Success = pcall(function()
@@ -542,7 +549,9 @@ Spawn(function()
             local Escape = Farm.ScanWorlds()
             if Escape then
                 HUD.Status.Text = Format("Escaping to %s", Escape.WorldName)
-                Farm.JoinServer(Escape)
+                if Farm.JoinServer(Escape) then
+                    Blacklist[Escape.JobID] = tick()
+                end
             else
                 -- no live raid found, just teleport out of this dead server
                 local PlaceId = Game.PlaceId
@@ -574,7 +583,13 @@ Spawn(function()
                         Farm.Notify("Raid Farm", Format("Raid found in %s — teleporting", Found.WorldName), 6)
 
                         State.InLobby = false
-                        if not Farm.JoinServer(Found) then
+                        if Farm.JoinServer(Found) then
+                            -- Blacklist this server immediately so the scanner doesn't
+                            -- re-find it while the server-side teleport is still in flight.
+                            -- This prevents the x11 same-server spam when the raid isn't
+                            -- active yet on arrival or the teleport is slow.
+                            Blacklist[Found.JobID] = tick()
+                        else
                             Farm.Notify("Raid Farm", "Teleport failed — retrying", 4)
                         end
 
