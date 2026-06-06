@@ -53,7 +53,7 @@ local State = {
     InLobby       = false,
     WasInRaid     = false,
     RaidEndedAt   = 0,
-    RaidEnteredAt = 0,
+    TimerZeroAt   = 0,   -- when KillDaCaptain.TimeLeft first hit 0
     LastJobID     = nil,
     HUD           = nil,
 }
@@ -323,6 +323,38 @@ do
         end)
     end)
 
+    -- Watch KillDaCaptain.TimeLeft — stamp when it first hits 0 so we can
+    -- detect a stuck raid (timer frozen at 00:00 but RaidActive never clears)
+    Spawn(function()
+        local function HookTimeLeft(Container)
+            local TimeLeft = Container:FindFirstChild("TimeLeft")
+            if not TimeLeft then return end
+            TimeLeft.Changed:Connect(function(Val)
+                if Val <= 0 and State.TimerZeroAt == 0 then
+                    State.TimerZeroAt = tick()
+                elseif Val > 0 then
+                    State.TimerZeroAt = 0
+                end
+            end)
+        end
+
+        -- might already exist
+        local Existing = ReplicatedStorage:FindFirstChild("KillDaCaptain")
+        if Existing then HookTimeLeft(Existing) end
+
+        ReplicatedStorage.ChildAdded:Connect(function(Child)
+            if Child.Name == "KillDaCaptain" then
+                State.TimerZeroAt = 0
+                HookTimeLeft(Child)
+            end
+        end)
+        ReplicatedStorage.ChildRemoved:Connect(function(Child)
+            if Child.Name == "KillDaCaptain" then
+                State.TimerZeroAt = 0
+            end
+        end)
+    end)
+
     -- Reconnect: watch the Roblox kick popup, same pattern as atmfarm
     Spawn(function()
         local Ok, Overlay = pcall(function()
@@ -383,11 +415,6 @@ Spawn(function()
 
         local NowInRaid = Farm.InRaid()
 
-        -- detect raid-started transition (track when we first entered)
-        if not State.WasInRaid and NowInRaid then
-            State.RaidEnteredAt = tick()
-        end
-
         -- detect raid-ended transition, give character time to leave ArenaSpectator
         if State.WasInRaid and not NowInRaid then
             State.RaidEndedAt = tick()
@@ -402,18 +429,18 @@ Spawn(function()
         end
         State.WasInRaid = NowInRaid
 
-        -- stuck-raid escape: timer at 00:00 but RaidActive never cleared
-        -- bail after 12 minutes in-raid (well past any real raid timer)
-        local StuckRaid = NowInRaid and State.RaidEnteredAt > 0 and (tick() - State.RaidEnteredAt) > 720
+        -- stuck-raid escape: KillDaCaptain.TimeLeft hit 0 but RaidActive never cleared
+        -- if the timer has been at 00:00 for >60s we're in a frozen server
+        local StuckRaid = NowInRaid and State.TimerZeroAt > 0 and (tick() - State.TimerZeroAt) > 60
         if StuckRaid then
             HUD.Status.Text = "Stuck raid — leaving"
-            HUD.Phase.Text  = "blacklisting & scanning"
+            HUD.Phase.Text  = "timer frozen >60s"
             local CurrentJob = Game.JobId
             if CurrentJob and CurrentJob ~= "" then
                 Blacklist[CurrentJob] = tick()
             end
-            State.RaidEnteredAt = 0
-            Farm.Webhook(Format("**Stuck raid detected** (>12min) — bailing | RP: **%d**", Farm.GetRP()))
+            State.TimerZeroAt = 0
+            Farm.Webhook(Format("**Stuck raid** (timer frozen >60s) — bailing | RP: **%d**", Farm.GetRP()))
 
             -- try to jump straight into a new raid; fall back to fresh reconnect
             local Escape = Farm.ScanWorlds()
