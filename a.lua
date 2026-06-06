@@ -39,6 +39,13 @@ local Config = {
     ["Rejoin Wait"]   = 20,
     ["Request Delay"] = 0.4,
     ["Reset Wait"]    = 6,
+    -- Code Redeemer — fill in via getgenv() so they survive server hops:
+    --   getgenv().RaidFarmDiscordToken = "YOUR_TOKEN"   (self-bot: raw token from browser devtools)
+    --   getgenv().RaidFarmCodesChannel = "CHANNEL_ID"   (right-click channel → Copy Channel ID)
+    -- Leave as "" to keep the feature disabled.
+    ["Discord Token"]      = Environment.RaidFarmDiscordToken or "",
+    ["Codes Channel ID"]   = Environment.RaidFarmCodesChannel or "",
+    ["Code Poll Interval"] = 90,
 }
 
 local Worlds = {
@@ -493,6 +500,157 @@ do
                 end
             end)
         end)
+    end)
+end
+
+-- Code Redeemer
+
+do
+    local HttpReq = request or (syn and syn.request) or http_request or nil
+
+    -- redeemed-code set and last-seen message ID both live in getgenv so they
+    -- persist across server-side teleports. they get wiped on TeleportService:Teleport()
+    -- reconnects, but that's fine — the server rejects already-redeemed codes.
+    if not Environment.RaidFarmLastCodeMsgID then
+        Environment.RaidFarmLastCodeMsgID = nil
+    end
+    if not Environment.RaidFarmRedeemedCodes then
+        Environment.RaidFarmRedeemedCodes = {}
+    end
+
+    local function FetchMessages()
+        local Token     = Config["Discord Token"]
+        local ChannelID = Config["Codes Channel ID"]
+        if Token == "" or ChannelID == "" or not HttpReq then return nil end
+
+        -- &after= cursor means we only get messages newer than the last one we saw
+        local Url = "https://discord.com/api/v10/channels/" .. ChannelID .. "/messages?limit=10"
+        if Environment.RaidFarmLastCodeMsgID then
+            Url = Url .. "&after=" .. Environment.RaidFarmLastCodeMsgID
+        end
+
+        local Ok, Result = pcall(HttpReq, {
+            Url     = Url,
+            Method  = "GET",
+            Headers = {
+                ["Authorization"] = Token,
+                ["User-Agent"]    = "Mozilla/5.0",
+            },
+        })
+        if not Ok or not Result or not Result.Success then return nil end
+
+        local Ok2, Data = pcall(HttpService.JSONDecode, HttpService, Result.Body)
+        if not Ok2 or type(Data) ~= "table" then return nil end
+        return Data
+    end
+
+    -- words that appear in announcements but are definitely not codes
+    local StopWords = {
+        THE=true, AND=true, FOR=true, WITH=true, THIS=true, FROM=true,
+        HAVE=true, BEEN=true, WILL=true, THAT=true, THEY=true, YOUR=true,
+        RAID=true, FARM=true, TYPE=true, SOUL=true, GAME=true, CODE=true,
+        FREE=true, DROP=true, LIKE=true, MORE=true, INTO=true, ONLY=true,
+        DISCORD=true, SERVER=true, ROBLOX=true, CODES=true, USING=true,
+        REWARD=true, BONUS=true, CLAIM=true, ENTER=true, LIMITED=true,
+        TIME=true, MAKE=true, SURE=true, HERE=true, DONT=true, JUST=true,
+    }
+
+    local function ExtractCodes(Content)
+        local Upper = Content:upper()
+        local Found = {}
+        local Seen  = {}
+
+        -- first pass: anything right after "code" / "codes" keyword — catches "code: RICHKID"
+        for Code in Upper:gmatch("CODES?%s*[:%!%=]%s*([A-Z0-9][A-Z0-9%-_]*)") do
+            if #Code >= 4 and #Code <= 25 and not Seen[Code] then
+                Found[#Found + 1] = Code
+                Seen[Code] = true
+            end
+        end
+
+        -- second pass: long standalone uppercase tokens not in the stopword list
+        -- 7-char min to avoid catching normal words; covers RICHKID (7), BETARELEASE (11), etc.
+        for Code in Upper:gmatch("[A-Z][A-Z0-9%-_]+[A-Z0-9]") do
+            if #Code >= 7 and #Code <= 25 and not StopWords[Code] and not Seen[Code] then
+                Found[#Found + 1] = Code
+                Seen[Code] = true
+            end
+        end
+
+        return Found
+    end
+
+    local function RedeemCode(Code)
+        local Char = Client.Character
+        if not Char then return false, "no character" end
+        local Handler = Char:FindFirstChild("CharacterHandler")
+        if not Handler then return false, "no CharacterHandler" end
+        local Remotes = Handler:FindFirstChild("Remotes")
+        if not Remotes then return false, "no Remotes" end
+        local CodesRemote = Remotes:FindFirstChild("Codes")
+        if not CodesRemote then return false, "Codes remote not found" end
+        local Ok, Success, Msg = pcall(function()
+            return CodesRemote:InvokeServer(Code)
+        end)
+        if not Ok then return false, "invoke failed" end
+        return Success, Msg or (Success and "Redeemed!" or "Already used or invalid")
+    end
+
+    local LastPoll = 0
+
+    Spawn(function()
+        while true do
+            Wait(5)
+            if tick() - LastPoll < Config["Code Poll Interval"] then continue end
+            LastPoll = tick()
+
+            local Messages = FetchMessages()
+            if not Messages or #Messages == 0 then continue end
+
+            -- Discord returns newest-first on initial fetch, ascending with &after=.
+            -- Either way, walk all messages and track the highest snowflake ID.
+            local NewestID = Environment.RaidFarmLastCodeMsgID
+            for _, Msg in ipairs(Messages) do
+                local MsgID = tostring(Msg.id or "")
+                if MsgID ~= "" then
+                    if not NewestID or tonumber(MsgID) > tonumber(NewestID) then
+                        NewestID = MsgID
+                    end
+                end
+            end
+
+            for _, Msg in ipairs(Messages) do
+                local Codes = ExtractCodes(tostring(Msg.content or ""))
+                for _, Code in ipairs(Codes) do
+                    if Environment.RaidFarmRedeemedCodes[Code] then continue end
+                    Environment.RaidFarmRedeemedCodes[Code] = true
+
+                    Wait(1)
+                    local Success, Result = RedeemCode(Code)
+                    Farm.Notify("Code Redeemer", Format("%s — %s", Code, Result), 8)
+
+                    if HttpReq then
+                        pcall(HttpReq, {
+                            Url     = Config["Webhook URL"],
+                            Method  = "POST",
+                            Headers = {["Content-Type"] = "application/json"},
+                            Body    = HttpService:JSONEncode({
+                                username = "Code Redeemer",
+                                embeds   = {{
+                                    title       = Success and "Code Redeemed ✓" or "Code Failed ✗",
+                                    description = Format("**`%s`**\n%s", Code, Result),
+                                    color       = Success and 3066993 or 15158332,
+                                }},
+                            }),
+                        })
+                    end
+                end
+            end
+
+            if NewestID then
+                Environment.RaidFarmLastCodeMsgID = NewestID
+            end
+        end
     end)
 end
 
