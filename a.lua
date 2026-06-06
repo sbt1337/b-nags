@@ -217,24 +217,35 @@ do
         if not Humanoid or Humanoid.Health <= 0 then return end
 
         Farm.DeathEffect()
-
-        -- connect BEFORE killing so we can't miss the event if respawn is instant
-        local Spawned = false
-        local Conn = Client.CharacterAdded:Connect(function()
-            Spawned = true
-        end)
-
         Humanoid.Health = 0
 
-        -- respawn timer is server-controlled; block until the new character arrives
-        local Deadline = tick() + 20
-        while not Spawned and tick() < Deadline do
-            Wait(0.5)
-        end
-        Conn:Disconnect()
+        -- ClientProgression.lua (line 1968) sets PlayerGui.FactionsUI.RespawnTimer.Visible
+        -- to true when the server countdown starts, and back to false when it hits 0
+        -- (right before the character actually spawns). Watch that instead of guessing.
+        local FactionsUI = Client.PlayerGui:FindFirstChild("FactionsUI")
+        local Timer      = FactionsUI and FactionsUI:FindFirstChild("RespawnTimer")
 
-        -- let CharacterHandler and remotes finish loading before the main loop
-        -- checks InLobby or tries to reset again
+        if Timer then
+            -- wait up to 6s for the countdown label to appear after death processing
+            local T = tick() + 6
+            while not Timer.Visible and tick() < T do
+                Wait(0.2)
+            end
+            -- wait for it to disappear — that's the server telling us respawn is now
+            T = tick() + 30
+            while Timer.Visible and tick() < T do
+                Wait(0.2)
+            end
+        else
+            -- FactionsUI not found; fall back to CharacterAdded
+            local Done = false
+            local Conn = Client.CharacterAdded:Connect(function() Done = true end)
+            local T    = tick() + 20
+            while not Done and tick() < T do Wait(0.5) end
+            Conn:Disconnect()
+        end
+
+        -- brief buffer for CharacterHandler and remotes to finish loading
         Wait(1.5)
     end
 
