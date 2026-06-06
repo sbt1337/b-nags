@@ -64,6 +64,12 @@ if not Environment.RaidFarmBlacklist then
 end
 local Blacklist = Environment.RaidFarmBlacklist
 
+-- item drop tracker persists across reconnects
+if not Environment.RaidFarmItems then
+    Environment.RaidFarmItems = {}
+end
+local ItemTotals = Environment.RaidFarmItems
+
 -- Webhook
 
 do
@@ -82,8 +88,12 @@ do
     end
 
     function Farm.WebhookRP()
-        local RP = Farm.GetRP()
-        Farm.Webhook(Format("**Raid Farm** — hourly update | RP: **%d**", RP))
+        local RP  = Farm.GetRP()
+        local Kan = Farm.GetKan()
+        Farm.Webhook(Format(
+            "**Raid Farm** — hourly update | RP: **%d** | Kan: **%d**\nItems this session: %s",
+            RP, Kan, Farm.ItemSummary()
+        ))
         State.LastWebhook = tick()
         Environment.RaidFarmLastWebhook = State.LastWebhook
     end
@@ -108,6 +118,20 @@ do
         local Char = Client.Character
         if not Char then return 0 end
         return Floor(Char:GetAttribute("RaidPoints") or 0)
+    end
+
+    function Farm.GetKan()
+        local Char = Client.Character
+        if not Char then return 0 end
+        return Floor(Char:GetAttribute("Kan") or 0)
+    end
+
+    function Farm.ItemSummary()
+        local Parts = {}
+        for Name, Count in next, ItemTotals do
+            Parts[#Parts + 1] = Format("**%s** ×%d", Name, Count)
+        end
+        return #Parts > 0 and table.concat(Parts, " | ") or "none"
     end
 
     function Farm.InRaid()
@@ -156,7 +180,7 @@ do
         Gui.Parent          = Client.PlayerGui
 
         local Frame = NewInstance("Frame")
-        Frame.Size                   = NewUDim2(0, 230, 0, 82)
+        Frame.Size                   = NewUDim2(0, 230, 0, 128)
         Frame.Position               = NewUDim2(1, -240, 0, 10)
         Frame.BackgroundColor3       = NewRGB(12, 12, 12)
         Frame.BackgroundTransparency = 0.25
@@ -183,9 +207,11 @@ do
         end
 
         return {
-            Status = Label("Status", 4,  NewRGB(230, 230, 230)),
-            Phase  = Label("Phase",  28, NewRGB(180, 130, 255)),
-            Points = Label("Points", 54, NewRGB(255, 169, 108)),
+            Status = Label("Status", 4,   NewRGB(230, 230, 230)),
+            Phase  = Label("Phase",  28,  NewRGB(180, 130, 255)),
+            Points = Label("Points", 52,  NewRGB(255, 169, 108)),
+            Kan    = Label("Kan",    76,  NewRGB(100, 200, 255)),
+            Items  = Label("Items",  100, NewRGB(120, 220, 120)),
         }
     end
 end
@@ -323,6 +349,20 @@ do
         end)
     end)
 
+    -- Hook ClientEffects to intercept ItemObtained — catches every raid drop
+    -- regardless of what the item is named, no hard-coded item list needed
+    pcall(function()
+        local EffectsRemote = ReplicatedStorage:WaitForChild("Remotes", 5)
+            :WaitForChild("ClientEffects", 5)
+        EffectsRemote.OnClientEvent:Connect(function(_, PathData, _, ItemName, Count)
+            if type(PathData) ~= "table" then return end
+            if PathData.Skill ~= "ItemObtained" then return end
+            if type(ItemName) ~= "string" or ItemName == "" then return end
+            local Qty = (type(Count) == "number" and Count > 1) and Count or 1
+            ItemTotals[ItemName] = (ItemTotals[ItemName] or 0) + Qty
+        end)
+    end)
+
     -- Watch KillDaCaptain.TimeLeft — stamp when it first hits 0 so we can
     -- detect a stuck raid (timer frozen at 00:00 but RaidActive never clears)
     Spawn(function()
@@ -407,7 +447,9 @@ Spawn(function()
         Wait(1)
 
         local HUD = State.HUD
-        HUD.Points.Text = Format("RP: %d", Farm.GetRP())
+        HUD.Points.Text = Format("RP: %d",  Farm.GetRP())
+        HUD.Kan.Text    = Format("Kan: %d", Farm.GetKan())
+        HUD.Items.Text  = Farm.ItemSummary()
 
         if tick() - State.LastWebhook >= 3600 then
             Farm.WebhookRP()
