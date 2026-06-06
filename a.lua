@@ -68,9 +68,23 @@ local State = {
     HUD           = nil,
 }
 
--- blacklist persists across reconnects via getgenv
+-- blacklist: lives in getgenv across server-side hops, AND in a local file so it
+-- survives TeleportService:Teleport() reconnects (which wipe getgenv on Delta mobile).
+-- ghost servers like ones stuck in the TS server list for hours stay blacklisted.
 if not Environment.RaidFarmBlacklist then
-    Environment.RaidFarmBlacklist = {}
+    Environment.RaidFarmBlacklist = (function()
+        if not readfile then return {} end
+        local Ok, Data = pcall(readfile, "raid_farm_blacklist.json")
+        if not Ok or not Data or Data == "" then return {} end
+        local Ok2, T = pcall(HttpService.JSONDecode, HttpService, Data)
+        if not Ok2 or type(T) ~= "table" then return {} end
+        -- prune entries older than 24h so the file doesn't grow forever
+        local Now = tick()
+        for JobID, Ts in next, T do
+            if Now - Ts > 86400 then T[JobID] = nil end
+        end
+        return T
+    end)()
 end
 local Blacklist = Environment.RaidFarmBlacklist
 
@@ -247,6 +261,15 @@ do
 
         -- brief buffer for CharacterHandler and remotes to finish loading
         Wait(1.5)
+    end
+
+    function Farm.Blacklist(JobID)
+        if not JobID or JobID == "" then return end
+        Blacklist[JobID] = tick()
+        -- persist to file so the entry survives getgenv wipes on reconnect
+        if writefile then
+            pcall(writefile, "raid_farm_blacklist.json", HttpService:JSONEncode(Blacklist))
+        end
     end
 
     function Farm.HookAfk()
@@ -508,7 +531,7 @@ do
                 -- blacklist the last attempted job so we don't re-join a dead server
                 local FailedJob = Environment.RaidFarmLastJob
                 if FailedJob then
-                    Blacklist[FailedJob] = tick()
+                    Farm.Blacklist(FailedJob)
                     Environment.RaidFarmLastJob = nil
                 end
 
@@ -712,10 +735,7 @@ Spawn(function()
             State.InLobby     = false
             State.DeathCount  = 0
             -- blacklist this server so scanner doesn't re-join the same job
-            local CurrentJob = Game.JobId
-            if CurrentJob and CurrentJob ~= "" then
-                Blacklist[CurrentJob] = tick()
-            end
+            Farm.Blacklist(Game.JobId)
             Farm.Webhook(Format("**Raid ended** — RP so far: **%d** | waiting 8s then scanning", Farm.GetRP()))
         end
         State.WasInRaid = NowInRaid
@@ -726,10 +746,7 @@ Spawn(function()
         if StuckRaid then
             HUD.Status.Text = "Stuck raid — leaving"
             HUD.Phase.Text  = "timer frozen >60s"
-            local CurrentJob = Game.JobId
-            if CurrentJob and CurrentJob ~= "" then
-                Blacklist[CurrentJob] = tick()
-            end
+            Farm.Blacklist(Game.JobId)
             State.TimerZeroAt = 0
             Farm.Webhook(Format("**Stuck raid** (timer frozen >60s) — bailing | RP: **%d**", Farm.GetRP()))
 
@@ -738,7 +755,7 @@ Spawn(function()
             if Escape then
                 HUD.Status.Text = Format("Escaping to %s", Escape.WorldName)
                 if Farm.JoinServer(Escape) then
-                    Blacklist[Escape.JobID] = tick()
+                    Farm.Blacklist(Escape.JobID)
                 end
             else
                 -- no live raid found, just teleport out of this dead server
@@ -772,17 +789,18 @@ Spawn(function()
 
                         State.InLobby = false
                         if Farm.JoinServer(Found) then
-                            -- Blacklist this server immediately so the scanner doesn't
-                            -- re-find it while the server-side teleport is still in flight.
-                            -- This prevents the x11 same-server spam when the raid isn't
-                            -- active yet on arrival or the teleport is slow.
-                            Blacklist[Found.JobID] = tick()
+                            -- blacklist immediately so the scanner doesn't re-find this
+                            -- server while the server-side teleport is still in flight
+                            Farm.Blacklist(Found.JobID)
                         else
                             Farm.Notify("Raid Farm", "Teleport failed — retrying", 4)
                         end
 
                         Wait(Config["Rejoin Wait"])
-                        State.LastScan = Farm.InRaid() and tick() or -Config["Scan Cooldown"]
+                        -- always enforce the full cooldown after a join attempt;
+                        -- the old "or -ScanCooldown" path caused a second teleport to fire
+                        -- before the first one landed (double-teleport into dead servers)
+                        State.LastScan = tick()
                     else
                         HUD.Status.Text = Format("No raid (retry in %ds)", Config["Scan Cooldown"])
                     end
@@ -812,7 +830,7 @@ Spawn(function()
                 if Escape then
                     HUD.Status.Text = Format("Hopping to %s", Escape.WorldName)
                     if Farm.JoinServer(Escape) then
-                        Blacklist[Escape.JobID] = tick()
+                        Farm.Blacklist(Escape.JobID)
                     end
                 else
                     local PlaceId = Game.PlaceId
