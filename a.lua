@@ -13,6 +13,8 @@ local NewUDim     = UDim.new
 local HttpService       = Game:GetService("HttpService")
 local ReplicatedStorage = Game:GetService("ReplicatedStorage")
 local TeleportService   = Game:GetService("TeleportService")
+local TweenService      = Game:GetService("TweenService")
+local Debris            = Game:GetService("Debris")
 local VirtualUser       = Game:GetService("VirtualUser")
 local Players           = Game:GetService("Players")
 local CoreGui           = Game:GetService("CoreGui")
@@ -148,13 +150,65 @@ do
         return false
     end
 
+    -- race → soul color, mirrors the per-race particle color in Soul.lua
+    local SoulColors = {
+        ["Shinigami"]  = NewRGB(180, 220, 255),
+        ["Visored"]    = NewRGB(180, 220, 255),
+        ["Quincy"]     = NewRGB(100, 160, 255),
+        ["Arrancar"]   = NewRGB(210, 160, 255),
+        ["Vastocar"]   = NewRGB(210, 160, 255),
+        ["Fullbringer"] = NewRGB(255, 200, 100),
+    }
+
+    function Farm.DeathEffect()
+        local Char = Client.Character
+        if not Char then return end
+        local Root = Char:FindFirstChild("HumanoidRootPart")
+        if not Root then return end
+
+        local Color = SoulColors[Char:GetAttribute("EntityType") or ""] or NewRGB(180, 220, 255)
+
+        -- Highlight pulse on the character (matches Soul.lua's Highlight flash)
+        local Hl = NewInstance("Highlight")
+        Hl.FillColor           = Color
+        Hl.OutlineColor        = Color
+        Hl.FillTransparency    = 1
+        Hl.OutlineTransparency = 1
+        Hl.DepthMode           = Enum.HighlightDepthMode.Occluded
+        Hl.Parent              = Char
+        TweenService:Create(Hl, TweenInfo.new(0.35), {
+            FillTransparency    = 0.25,
+            OutlineTransparency = 0.25,
+        }):Play()
+        Debris:AddItem(Hl, 1.2)
+
+        -- expanding neon sphere (approximates soulOutOfBody's script.Force part)
+        local Sphere = NewInstance("Part")
+        Sphere.Shape        = Enum.PartType.Ball
+        Sphere.Material     = Enum.Material.Neon
+        Sphere.Color        = Color
+        Sphere.Size         = Vector3.new(1, 1, 1)
+        Sphere.Anchored     = true
+        Sphere.CanCollide   = false
+        Sphere.Transparency = 0.25
+        Sphere.CFrame       = Root.CFrame
+        Sphere.Parent       = workspace
+        TweenService:Create(Sphere, TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+            Size        = Vector3.new(18, 18, 18),
+            Transparency = 1,
+        }):Play()
+        Debris:AddItem(Sphere, 1)
+
+        Wait(0.4)  -- let the flash peak before health drops
+    end
+
     function Farm.ResetChar()
         local Char = Client.Character
         if not Char then return end
         local Humanoid = Char:FindFirstChildOfClass("Humanoid")
-        if Humanoid and Humanoid.Health > 0 then
-            Humanoid.Health = 0
-        end
+        if not Humanoid or Humanoid.Health <= 0 then return end
+        Farm.DeathEffect()
+        Humanoid.Health = 0
     end
 
     function Farm.HookAfk()
