@@ -546,6 +546,14 @@ do
         local function HookTimeLeft(Container)
             local TimeLeft = Container:FindFirstChild("TimeLeft")
             if not TimeLeft then return end
+
+            -- seed immediately from current value — critical for joining a server
+            -- where the timer is ALREADY at 0; Changed never fires in that case
+            -- so without this check TimerZeroAt stays 0 and StuckRaid never triggers
+            if (TimeLeft.Value or 0) <= 0 and State.TimerZeroAt == 0 then
+                State.TimerZeroAt = tick()
+            end
+
             TimeLeft.Changed:Connect(function(Val)
                 if Val <= 0 and State.TimerZeroAt == 0 then
                     State.TimerZeroAt = tick()
@@ -873,6 +881,16 @@ Spawn(function()
             State.DeathCount = 0   -- made it in; clear so next raid entry starts from 1
             HUD.Status.Text = "Lobby — farming RP"
             HUD.Phase.Text  = ""
+
+            -- backup: if we somehow missed the initial-value seed (e.g. KillDaCaptain
+            -- spawned before the hook was registered), catch it here every tick
+            if NowInRaid and State.TimerZeroAt == 0 then
+                local Kdc = ReplicatedStorage:FindFirstChild("KillDaCaptain")
+                local Tl  = Kdc and Kdc:FindFirstChild("TimeLeft")
+                if Tl and (Tl.Value or 0) <= 0 then
+                    State.TimerZeroAt = tick()
+                end
+            end
 
         else
             State.DeathCount += 1
