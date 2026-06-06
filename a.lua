@@ -554,44 +554,40 @@ do
         end)
     end)
 
-    -- Watch KillDaCaptain.TimeLeft — stamp when it first hits 0 so we can
-    -- detect a stuck raid (timer frozen at 00:00 but RaidActive never clears)
+    -- Poll the in-game scoreboard timer every second.
+    -- Two possible paths: ClanWarUI (clan war raids) and ChampionshipUI (championship raids).
+    -- When either reads "00:00" stamp TimerZeroAt; clear it when a live timer is found.
+    -- Simpler and more reliable than watching KillDaCaptain.TimeLeft which misses joins mid-raid.
     Spawn(function()
-        local function HookTimeLeft(Container)
-            local TimeLeft = Container:FindFirstChild("TimeLeft")
-            if not TimeLeft then return end
+        while true do
+            Wait(1)
 
-            -- seed immediately from current value — critical for joining a server
-            -- where the timer is ALREADY at 0; Changed never fires in that case
-            -- so without this check TimerZeroAt stays 0 and StuckRaid never triggers
-            if (TimeLeft.Value or 0) <= 0 and State.TimerZeroAt == 0 then
-                State.TimerZeroAt = tick()
+            local TimerText = nil
+
+            local Gui1 = Client.PlayerGui:FindFirstChild("ClanWarUI")
+            local T1   = Gui1
+                and Gui1:FindFirstChild("Scoreboard")
+                and Gui1.Scoreboard:FindFirstChild("Timer")
+            if T1 then TimerText = T1.Text end
+
+            if not TimerText then
+                local Gui2 = Client.PlayerGui:FindFirstChild("ChampionshipUI")
+                local T2   = Gui2
+                    and Gui2:FindFirstChild("Scoreboard")
+                    and Gui2.Scoreboard:FindFirstChild("Timer")
+                if T2 then TimerText = T2.Text end
             end
 
-            TimeLeft.Changed:Connect(function(Val)
-                if Val <= 0 and State.TimerZeroAt == 0 then
+            if TimerText == "00:00" then
+                if State.TimerZeroAt == 0 then
                     State.TimerZeroAt = tick()
-                elseif Val > 0 then
-                    State.TimerZeroAt = 0
                 end
-            end)
+            elseif TimerText ~= nil then
+                -- timer found and ticking — raid still live
+                State.TimerZeroAt = 0
+            end
+            -- if neither UI exists yet, leave TimerZeroAt alone
         end
-
-        -- might already exist
-        local Existing = ReplicatedStorage:FindFirstChild("KillDaCaptain")
-        if Existing then HookTimeLeft(Existing) end
-
-        ReplicatedStorage.ChildAdded:Connect(function(Child)
-            if Child.Name == "KillDaCaptain" then
-                State.TimerZeroAt = 0
-                HookTimeLeft(Child)
-            end
-        end)
-        ReplicatedStorage.ChildRemoved:Connect(function(Child)
-            if Child.Name == "KillDaCaptain" then
-                State.TimerZeroAt = 0
-            end
-        end)
     end)
 
     -- Reconnect: watch the Roblox kick popup, same pattern as atmfarm
@@ -850,6 +846,7 @@ Spawn(function()
             State.RaidEndedAt = tick()
             State.InLobby     = false
             State.JoinedAt    = 0
+            State.TimerZeroAt = 0
             -- blacklist this server so scanner doesn't re-join the same job
             Farm.Blacklist(Game.JobId)
             Farm.Webhook(Format("**Raid ended** — RP so far: **%d** | waiting 8s then scanning", Farm.GetRP()))
@@ -927,15 +924,6 @@ Spawn(function()
             HUD.Status.Text = "Lobby — farming RP"
             HUD.Phase.Text  = ""
 
-            -- backup: if we somehow missed the initial-value seed (e.g. KillDaCaptain
-            -- spawned before the hook was registered), catch it here every tick
-            if NowInRaid and State.TimerZeroAt == 0 then
-                local Kdc = ReplicatedStorage:FindFirstChild("KillDaCaptain")
-                local Tl  = Kdc and Kdc:FindFirstChild("TimeLeft")
-                if Tl and (Tl.Value or 0) <= 0 then
-                    State.TimerZeroAt = tick()
-                end
-            end
 
         else
             -- 15-minute timeout: if we've been in this server that long without
