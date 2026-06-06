@@ -58,7 +58,7 @@ local Farm  = {Connections = {}}
 local State = {
     -- start 30s behind so the first scan has a full cooldown on fresh injection/reconnect
     LastScan      = tick() - Config["Scan Cooldown"] + 30,
-    DeathCount    = 0,
+    JoinedAt      = 0,   -- tick() when we first entered the current raid server
     LastWebhook   = Environment.RaidFarmLastWebhook or tick(),
     InLobby       = false,
     WasInRaid     = false,
@@ -840,11 +840,16 @@ Spawn(function()
 
         local NowInRaid = Farm.InRaid()
 
+        -- detect entering a new raid server — stamp join time for the 15min timeout
+        if not State.WasInRaid and NowInRaid then
+            State.JoinedAt = tick()
+        end
+
         -- detect raid-ended transition, give character time to leave ArenaSpectator
         if State.WasInRaid and not NowInRaid then
             State.RaidEndedAt = tick()
             State.InLobby     = false
-            State.DeathCount  = 0
+            State.JoinedAt    = 0
             -- blacklist this server so scanner doesn't re-join the same job
             Farm.Blacklist(Game.JobId)
             Farm.Webhook(Format("**Raid ended** — RP so far: **%d** | waiting 8s then scanning", Farm.GetRP()))
@@ -919,7 +924,6 @@ Spawn(function()
             end
 
         elseif Farm.InLobby() then
-            State.DeathCount = 0   -- made it in; clear so next raid entry starts from 1
             HUD.Status.Text = "Lobby — farming RP"
             HUD.Phase.Text  = ""
 
@@ -934,38 +938,30 @@ Spawn(function()
             end
 
         else
-            State.DeathCount += 1
-
-            -- 5 resets and still not spectating = bugged lobby, get out
-            if State.DeathCount > 5 then
-                -- hold at 5 so if the teleport stalls and we're somehow still here,
-                -- the next tick bails again immediately instead of resetting to #1/5
-                State.DeathCount = 5
-                HUD.Status.Text = "Bugged lobby — escaping"
+            -- 15-minute timeout: if we've been in this server that long without
+            -- ever reaching the lobby it's broken — blacklist it and hop out
+            if State.JoinedAt > 0 and (tick() - State.JoinedAt) > 900 then
+                HUD.Status.Text = "15min — no lobby, hopping"
                 HUD.Phase.Text  = ""
                 Farm.Blacklist(Game.JobId)
                 Farm.Webhook(Format(
-                    "**Bugged lobby** (5 resets, never reached ArenaSpectator) — teleporting out | RP: **%d**",
+                    "**Server timeout** (15min, never reached lobby) — hopping | RP: **%d**",
                     Farm.GetRP()
                 ))
-                Farm.Notify("Raid Farm", "Bugged lobby after 5 resets — escaping", 6)
+                Farm.Notify("Raid Farm", "15min in server, never got lobby — hopping", 6)
 
-                -- ServerListTeleport is blocked server-side when inside an active raid;
-                -- use TeleportService directly — it's engine-level and can't be rejected
+                -- ServerListTeleport is blocked inside an active raid; go engine-level
                 local PlaceId = Game.PlaceId
                 while true do
                     local Ok = pcall(function() TeleportService:Teleport(PlaceId, Client) end)
                     if Ok then break end
                     Wait(3)
                 end
-                Wait(Config["Rejoin Wait"])
+                -- block here so the loop can't re-trigger; engine disconnect kills the thread
+                while true do Wait(60) end
             else
                 HUD.Status.Text = "Getting to lobby..."
-                HUD.Phase.Text  = Format("Reset #%d / 5", State.DeathCount)
-
-                if State.DeathCount == 1 then
-                    Farm.Notify("Raid Farm", "In raid — resetting to lobby", 4)
-                end
+                HUD.Phase.Text  = ""
 
                 Farm.ResetChar()
                 Wait(Config["Reset Wait"])
