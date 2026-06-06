@@ -334,6 +334,53 @@ end
 -- Scanner
 
 do
+    local HttpReq = request or (syn and syn.request) or http_request or nil
+
+    -- Set of JobIDs Roblox's own registry confirms are alive right now.
+    -- RequestServerList returns stale data — servers stay listed as Raid==true
+    -- for minutes after they actually shut down. Cross-referencing against
+    -- games.roblox.com eliminates those ghosts before we even try to join.
+    local LiveServers   = {}
+    local LastSync      = 0
+    local SyncInterval  = 45  -- refresh every 45s
+
+    local function SyncLiveServers()
+        if tick() - LastSync < SyncInterval then return end
+        LastSync = tick()
+        if not HttpReq then return end
+
+        local PlaceId = tostring(Game.PlaceId)
+        local Fresh   = {}
+        local Cursor  = ""
+
+        for _ = 1, 8 do   -- cap at 8 pages / 800 servers
+            local Url = "https://games.roblox.com/v1/games/" .. PlaceId
+                .. "/servers/Public?sortOrder=Asc&excludeFullGames=false&limit=100"
+            if Cursor ~= "" then Url = Url .. "&cursor=" .. Cursor end
+
+            local Ok, Result = pcall(HttpReq, {Url = Url, Method = "GET"})
+            if not Ok or not Result or not Result.Success then break end
+
+            local Ok2, Data = pcall(HttpService.JSONDecode, HttpService, Result.Body)
+            if not Ok2 or type(Data) ~= "table" or type(Data.data) ~= "table" then break end
+
+            for _, Srv in ipairs(Data.data) do
+                if type(Srv.id) == "string" and Srv.id ~= "" then
+                    Fresh[Srv.id] = true
+                end
+            end
+
+            Cursor = type(Data.nextPageCursor) == "string" and Data.nextPageCursor or ""
+            if Cursor == "" then break end
+            Wait(0.15)
+        end
+
+        -- only replace if we got actual data; a failed fetch keeps the last known set
+        if next(Fresh) then
+            LiveServers = Fresh
+        end
+    end
+
     function Farm.FindRaid(WorldName)
         local Requests = ReplicatedStorage:FindFirstChild("Requests")
         if not Requests then return nil end
@@ -351,12 +398,26 @@ do
                 if type(Data) ~= "table" then continue end
                 if Data.Raid ~= true then continue end
                 if (Data.ServerPlayers or 0) >= (Data.ServerPlayerMax or 99) then continue end
-                local JobID = Data.JobID
+
+                local JobID    = Data.JobID
+                local Reserved = Data.ReservedId ~= nil and Data.ReservedId ~= ""
+
                 if Blacklist[JobID] and tick() - Blacklist[JobID] < 300 then continue end
+
+                -- validate against Roblox's live registry; public servers not in the list
+                -- are dead ghosts — blacklist them now so we never try again.
+                -- reserved-server instances don't appear in the public list, skip the check.
+                if not Reserved and next(LiveServers) ~= nil then
+                    if not LiveServers[JobID] then
+                        Farm.Blacklist(JobID)
+                        continue
+                    end
+                end
+
                 return {
                     WorldName  = WorldName,
                     ServerName = Data.ServerName or "Unknown",
-                    JobID      = Data.JobID,
+                    JobID      = JobID,
                     ReservedId = Data.ReservedId,
                 }
             end
@@ -366,6 +427,7 @@ do
     end
 
     function Farm.ScanWorlds()
+        SyncLiveServers()   -- refresh live-server set before each scan pass
         for _, World in next, Worlds do
             local Found = Farm.FindRaid(World)
             if Found then return Found end
