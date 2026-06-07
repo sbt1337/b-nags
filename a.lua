@@ -62,9 +62,14 @@ local State = {
     LastWebhook   = Environment.RaidFarmLastWebhook or tick(),
     InLobby       = false,
     WasInRaid     = false,
+    WasInLobby    = false,
     RaidEndedAt   = 0,
-    TimerZeroAt   = 0,   -- when KillDaCaptain.TimeLeft first hit 0
+    TimerZeroAt   = 0,   -- tick() when the on-screen raid timer first read 00:00
     LastJobID     = nil,
+    LastRPSeen    = 0,   -- highest RaidPoints value observed — feeds the stall watchdog
+    LastRPGain    = tick(),
+    LastErrorAt   = 0,   -- throttle for loop-error webhooks
+    LastTick      = tick(),  -- heartbeat for the hang watchdog
     HUD           = nil,
 }
 
@@ -272,6 +277,30 @@ do
         end
     end
 
+    -- shared "this server is bad, get out" path — blacklists the current job,
+    -- reports why over webhook, then tries to hop straight into another raid
+    -- before falling back to a bare reconnect. Used by every bail condition
+    -- (stuck raid, low population, RP stagnation) so the escape logic lives
+    -- in exactly one place.
+    function Farm.BailServer(WebhookMsg)
+        local HUD = State.HUD
+        Farm.Blacklist(Game.JobId)
+        State.TimerZeroAt = 0
+        Farm.Webhook(WebhookMsg)
+
+        local Escape = Farm.ScanWorlds()
+        if Escape then
+            HUD.Status.Text = Format("Escaping to %s", Escape.WorldName)
+            if Farm.JoinServer(Escape) then
+                Farm.Blacklist(Escape.JobID)
+            end
+        else
+            local PlaceId = Game.PlaceId
+            pcall(function() TeleportService:Teleport(PlaceId, Client) end)
+        end
+        Wait(Config["Rejoin Wait"])
+    end
+
     function Farm.HookAfk()
         local Requests = ReplicatedStorage:FindFirstChild("Requests")
         if not Requests then return end
@@ -398,6 +427,7 @@ do
                 if type(Data) ~= "table" then continue end
                 if Data.Raid ~= true then continue end
                 if (Data.ServerPlayers or 0) >= (Data.ServerPlayerMax or 99) then continue end
+                if (Data.ServerPlayers or 0) <= 7 then continue end  -- low pop = bad raid, skip it entirely
 
                 local JobID    = Data.JobID
                 local Reserved = Data.ReservedId ~= nil and Data.ReservedId ~= ""
@@ -513,6 +543,23 @@ do
                 VirtualUser:CaptureController()
                 VirtualUser:ClickButton2(NewVector2())
             end)
+        end
+    end)
+
+    -- Heartbeat watchdog: the main loop stamps State.LastTick every second.
+    -- If it's gone quiet for 2 minutes, it's hung on something that never
+    -- returns (a WaitForChild/InvokeServer with no timeout, a stuck yield —
+    -- Type Soul throws weird stuff at you). Force a reconnect rather than
+    -- let the farm sit there frozen for the rest of the night.
+    Spawn(function()
+        while true do
+            Wait(30)
+            if State.LastTick > 0 and (tick() - State.LastTick) > 120 then
+                Farm.Webhook(Format("**Watchdog** — main loop hung >2min, forcing reconnect | RP: **%d**", Farm.GetRP()))
+                local PlaceId = Game.PlaceId
+                pcall(function() TeleportService:Teleport(PlaceId, Client) end)
+                while true do Wait(60) end  -- engine disconnect kills this; stop re-firing
+            end
         end
     end)
 
@@ -820,138 +867,176 @@ Spawn(function()
     State.HUD.Status.Text = "Raid Farm — starting"
     Farm.Notify("Raid Farm", "Started — scanning for raids", 5)
 
+    -- run counter persists across reconnects — a high count overnight is a
+    -- stability signal worth knowing about even if the farm keeps recovering
+    if not Environment.RaidFarmStartCount then
+        Environment.RaidFarmStartCount = 0
+    end
+    Environment.RaidFarmStartCount += 1
+    Farm.Webhook(Format("**Raid Farm started** (run #%d this session) — RP: **%d**",
+        Environment.RaidFarmStartCount, Farm.GetRP()))
+
     while true do
         Wait(1)
+        State.LastTick = tick()
 
-        local HUD = State.HUD
-        HUD.Points.Text = Format("RP: %d",  Farm.GetRP())
-        HUD.Kan.Text    = Format("Kan: %d", Farm.GetKan())
-        HUD.Items.Text  = Farm.ItemSummary()
+        local Ok, Err = pcall(function()
+            local HUD = State.HUD
+            HUD.Points.Text = Format("RP: %d",  Farm.GetRP())
+            HUD.Kan.Text    = Format("Kan: %d", Farm.GetKan())
+            HUD.Items.Text  = Farm.ItemSummary()
 
-        if tick() - State.LastWebhook >= 3600 then
-            Farm.WebhookRP()
-        end
-
-        local NowInRaid = Farm.InRaid()
-
-        -- detect entering a new raid server — stamp join time for the 15min timeout
-        if not State.WasInRaid and NowInRaid then
-            State.JoinedAt = tick()
-        end
-
-        -- detect raid-ended transition, give character time to leave ArenaSpectator
-        if State.WasInRaid and not NowInRaid then
-            State.RaidEndedAt = tick()
-            State.InLobby     = false
-            State.JoinedAt    = 0
-            State.TimerZeroAt = 0
-            -- blacklist this server so scanner doesn't re-join the same job
-            Farm.Blacklist(Game.JobId)
-            Farm.Webhook(Format("**Raid ended** — RP so far: **%d** | waiting 8s then scanning", Farm.GetRP()))
-        end
-        State.WasInRaid = NowInRaid
-
-        -- stuck-raid escape: timer frozen at 00:00 but the raid never wraps up
-        -- give it a full 3 minutes before bailing — some raids legitimately sit
-        -- on 00:00 for a bit during the boss-kill / results transition
-        -- don't require NowInRaid here — RaidActive can flip false while the timer
-        -- is still visibly frozen at 00:00, which is the exact bug we're escaping
-        local StuckRaid = State.TimerZeroAt > 0 and (tick() - State.TimerZeroAt) > 180
-        if StuckRaid then
-            HUD.Status.Text = "Stuck raid — leaving"
-            HUD.Phase.Text  = "timer frozen >3min"
-            Farm.Blacklist(Game.JobId)
-            State.TimerZeroAt = 0
-            Farm.Webhook(Format("**Stuck raid** (timer frozen >3min) — bailing | RP: **%d**", Farm.GetRP()))
-
-            -- try to jump straight into a new raid; fall back to fresh reconnect
-            local Escape = Farm.ScanWorlds()
-            if Escape then
-                HUD.Status.Text = Format("Escaping to %s", Escape.WorldName)
-                if Farm.JoinServer(Escape) then
-                    Farm.Blacklist(Escape.JobID)
-                end
-            else
-                -- no live raid found, just teleport out of this dead server
-                local PlaceId = Game.PlaceId
-                pcall(function() TeleportService:Teleport(PlaceId, Client) end)
+            if tick() - State.LastWebhook >= 3600 then
+                Farm.WebhookRP()
             end
-            Wait(Config["Rejoin Wait"])
-        elseif not NowInRaid then
-            local PostRaidWait = 8 - (tick() - State.RaidEndedAt)
-            if PostRaidWait > 0 then
-                HUD.Status.Text = Format("Raid ended — waiting %ds", Ceil(PostRaidWait))
-                HUD.Phase.Text  = "letting character reset..."
-            else
-                local TimeLeft = Ceil(Config["Scan Cooldown"] - (tick() - State.LastScan))
 
-                if TimeLeft > 0 then
-                    HUD.Status.Text = Format("Scan in %ds", TimeLeft)
-                    HUD.Phase.Text  = ""
+            -- track RP gains globally — feeds the stall watchdog in the lobby branch
+            local CurrentRP = Farm.GetRP()
+            if CurrentRP > State.LastRPSeen then
+                State.LastRPSeen = CurrentRP
+                State.LastRPGain = tick()
+            end
+
+            local NowInRaid  = Farm.InRaid()
+            local NowInLobby = Farm.InLobby()
+            local LowPop     = NowInRaid and #Players:GetPlayers() <= 7
+
+            -- detect entering a new raid server — stamp join time for the 15min timeout
+            if not State.WasInRaid and NowInRaid then
+                State.JoinedAt = tick()
+            end
+
+            -- detect raid-ended transition, give character time to leave ArenaSpectator
+            if State.WasInRaid and not NowInRaid then
+                State.RaidEndedAt = tick()
+                State.InLobby     = false
+                State.JoinedAt    = 0
+                State.TimerZeroAt = 0
+                -- blacklist this server so scanner doesn't re-join the same job
+                Farm.Blacklist(Game.JobId)
+                Farm.Webhook(Format("**Raid ended** — RP so far: **%d** | waiting 8s then scanning", Farm.GetRP()))
+            end
+            State.WasInRaid = NowInRaid
+
+            -- detect entering the lobby — reset the stall window here so a slow
+            -- travel/scan phase beforehand doesn't immediately read as "RP stalled"
+            if not State.WasInLobby and NowInLobby then
+                State.LastRPGain = tick()
+                State.LastRPSeen = CurrentRP
+            end
+            State.WasInLobby = NowInLobby
+
+            -- stuck-raid escape: timer frozen at 00:00 but the raid never wraps up.
+            -- gated on "not in lobby" too — some raid types never show a live
+            -- countdown (the label sits on a static/missing "00:00"), and that
+            -- shouldn't bail us while we're sitting there happily farming RP
+            -- give it a full 3 minutes — some raids legitimately sit on 00:00
+            -- during the boss-kill / results transition before wrapping up
+            -- don't require NowInRaid — RaidActive can flip false while the timer
+            -- is still visibly frozen at 00:00, which is the exact bug we're escaping
+            local StuckRaid = State.TimerZeroAt > 0
+                and (tick() - State.TimerZeroAt) > 180
+                and not NowInLobby
+
+            if StuckRaid then
+                HUD.Status.Text = "Stuck raid — leaving"
+                HUD.Phase.Text  = "timer frozen >3min"
+                Farm.BailServer(Format("**Stuck raid** (timer frozen >3min) — bailing | RP: **%d**", Farm.GetRP()))
+            elseif LowPop then
+                local Count = #Players:GetPlayers()
+                HUD.Status.Text = "Low population — hopping"
+                HUD.Phase.Text  = Format("%d players", Count)
+                Farm.BailServer(Format("**Low population** (%d players) — hopping | RP: **%d**", Count, Farm.GetRP()))
+            elseif not NowInRaid then
+                local PostRaidWait = 8 - (tick() - State.RaidEndedAt)
+                if PostRaidWait > 0 then
+                    HUD.Status.Text = Format("Raid ended — waiting %ds", Ceil(PostRaidWait))
+                    HUD.Phase.Text  = "letting character reset..."
                 else
-                    HUD.Status.Text = "Scanning worlds..."
-                    HUD.Phase.Text  = ""
-                    State.LastScan  = tick()
+                    local TimeLeft = Ceil(Config["Scan Cooldown"] - (tick() - State.LastScan))
 
-                    local Found = Farm.ScanWorlds()
-
-                    if Found then
-                        HUD.Status.Text = Format("Joining %s", Found.WorldName)
-                        Farm.Notify("Raid Farm", Format("Raid found in %s — teleporting", Found.WorldName), 6)
-
-                        State.InLobby = false
-                        if Farm.JoinServer(Found) then
-                            -- blacklist immediately so the scanner doesn't re-find this
-                            -- server while the server-side teleport is still in flight
-                            Farm.Blacklist(Found.JobID)
-                        else
-                            Farm.Notify("Raid Farm", "Teleport failed — retrying", 4)
-                        end
-
-                        Wait(Config["Rejoin Wait"])
-                        -- always enforce the full cooldown after a join attempt;
-                        -- the old "or -ScanCooldown" path caused a second teleport to fire
-                        -- before the first one landed (double-teleport into dead servers)
-                        State.LastScan = tick()
+                    if TimeLeft > 0 then
+                        HUD.Status.Text = Format("Scan in %ds", TimeLeft)
+                        HUD.Phase.Text  = ""
                     else
-                        HUD.Status.Text = Format("No raid (retry in %ds)", Config["Scan Cooldown"])
+                        HUD.Status.Text = "Scanning worlds..."
+                        HUD.Phase.Text  = ""
+                        State.LastScan  = tick()
+
+                        local Found = Farm.ScanWorlds()
+
+                        if Found then
+                            HUD.Status.Text = Format("Joining %s", Found.WorldName)
+                            Farm.Notify("Raid Farm", Format("Raid found in %s — teleporting", Found.WorldName), 6)
+
+                            State.InLobby = false
+                            if Farm.JoinServer(Found) then
+                                -- blacklist immediately so the scanner doesn't re-find this
+                                -- server while the server-side teleport is still in flight
+                                Farm.Blacklist(Found.JobID)
+                            else
+                                Farm.Notify("Raid Farm", "Teleport failed — retrying", 4)
+                            end
+
+                            Wait(Config["Rejoin Wait"])
+                            -- always enforce the full cooldown after a join attempt;
+                            -- the old "or -ScanCooldown" path caused a second teleport to fire
+                            -- before the first one landed (double-teleport into dead servers)
+                            State.LastScan = tick()
+                        else
+                            HUD.Status.Text = Format("No raid (retry in %ds)", Config["Scan Cooldown"])
+                        end
                     end
                 end
-            end
 
-        elseif Farm.InLobby() then
-            HUD.Status.Text = "Lobby — farming RP"
-            HUD.Phase.Text  = ""
-
-
-        else
-            -- 15-minute timeout: if we've been in this server that long without
-            -- ever reaching the lobby it's broken — blacklist it and hop out
-            if State.JoinedAt > 0 and (tick() - State.JoinedAt) > 900 then
-                HUD.Status.Text = "15min — no lobby, hopping"
+            elseif NowInLobby then
+                HUD.Status.Text = "Lobby — farming RP"
                 HUD.Phase.Text  = ""
-                Farm.Blacklist(Game.JobId)
-                Farm.Webhook(Format(
-                    "**Server timeout** (15min, never reached lobby) — hopping | RP: **%d**",
-                    Farm.GetRP()
-                ))
-                Farm.Notify("Raid Farm", "15min in server, never got lobby — hopping", 6)
 
-                -- ServerListTeleport is blocked inside an active raid; go engine-level
-                local PlaceId = Game.PlaceId
-                while true do
-                    local Ok = pcall(function() TeleportService:Teleport(PlaceId, Client) end)
-                    if Ok then break end
-                    Wait(3)
+                -- RP-stagnation watchdog: 20 minutes in the lobby with zero gain
+                -- means something's wrong that none of the other checks caught
+                -- (soft-lock, AFK kick, whatever) — blacklist and hop
+                if (tick() - State.LastRPGain) > 1200 then
+                    HUD.Status.Text = "RP stalled — hopping"
+                    Farm.BailServer(Format("**RP stalled** (no gain in 20min while in lobby) — hopping | RP: **%d**", CurrentRP))
                 end
-                -- block here so the loop can't re-trigger; engine disconnect kills the thread
-                while true do Wait(60) end
-            else
-                HUD.Status.Text = "Getting to lobby..."
-                HUD.Phase.Text  = ""
 
-                Farm.ResetChar()
-                Wait(Config["Reset Wait"])
+            else
+                -- 15-minute timeout: if we've been in this server that long without
+                -- ever reaching the lobby it's broken — blacklist it and hop out
+                if State.JoinedAt > 0 and (tick() - State.JoinedAt) > 900 then
+                    HUD.Status.Text = "15min — no lobby, hopping"
+                    HUD.Phase.Text  = ""
+                    Farm.Blacklist(Game.JobId)
+                    Farm.Webhook(Format(
+                        "**Server timeout** (15min, never reached lobby) — hopping | RP: **%d**",
+                        Farm.GetRP()
+                    ))
+                    Farm.Notify("Raid Farm", "15min in server, never got lobby — hopping", 6)
+
+                    -- ServerListTeleport is blocked inside an active raid; go engine-level
+                    local PlaceId = Game.PlaceId
+                    while true do
+                        local TpOk = pcall(function() TeleportService:Teleport(PlaceId, Client) end)
+                        if TpOk then break end
+                        Wait(3)
+                    end
+                    -- block here so the loop can't re-trigger; engine disconnect kills the thread
+                    while true do Wait(60) end
+                else
+                    HUD.Status.Text = "Getting to lobby..."
+                    HUD.Phase.Text  = ""
+
+                    Farm.ResetChar()
+                    Wait(Config["Reset Wait"])
+                end
+            end
+        end)
+
+        if not Ok then
+            if tick() - State.LastErrorAt > 30 then
+                State.LastErrorAt = tick()
+                Farm.Webhook(Format("**Loop error** — %s", tostring(Err)))
             end
         end
     end
