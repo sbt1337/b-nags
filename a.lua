@@ -554,39 +554,43 @@ do
         end)
     end)
 
-    -- Poll the in-game scoreboard timer every second.
-    -- Two possible paths: ClanWarUI (clan war raids) and ChampionshipUI (championship raids).
-    -- When either reads "00:00" stamp TimerZeroAt; clear it when a live timer is found.
-    -- Simpler and more reliable than watching KillDaCaptain.TimeLeft which misses joins mid-raid.
+    -- Scan every TextLabel in every ScreenGui every second.
+    -- No hardcoded paths — if anything reads "00:00" while we're in a raid, that's the timer.
+    -- Prints live so you can verify in the executor console.
     Spawn(function()
         while true do
             Wait(1)
 
-            local TimerText = nil
-
-            local Gui1 = Client.PlayerGui:FindFirstChild("ClanWarUI")
-            local T1   = Gui1
-                and Gui1:FindFirstChild("Scoreboard")
-                and Gui1.Scoreboard:FindFirstChild("Timer")
-            if T1 then TimerText = T1.Text end
-
-            if not TimerText then
-                local Gui2 = Client.PlayerGui:FindFirstChild("ChampionshipUI")
-                local T2   = Gui2
-                    and Gui2:FindFirstChild("Scoreboard")
-                    and Gui2.Scoreboard:FindFirstChild("Timer")
-                if T2 then TimerText = T2.Text end
+            if not Farm.InRaid() then
+                if State.TimerZeroAt ~= 0 then State.TimerZeroAt = 0 end
+                continue
             end
 
-            if TimerText == "00:00" then
+            local Found = false
+            for _, Gui in ipairs(Client.PlayerGui:GetChildren()) do
+                if not Gui:IsA("ScreenGui") then continue end
+                for _, Desc in ipairs(Gui:GetDescendants()) do
+                    if Desc:IsA("TextLabel") and Desc.Text == "00:00" then
+                        Found = true
+                        break
+                    end
+                end
+                if Found then break end
+            end
+
+            if Found then
                 if State.TimerZeroAt == 0 then
                     State.TimerZeroAt = tick()
+                    print("[RaidFarm] timer hit 00:00 — stuck check started")
+                else
+                    print(Format("[RaidFarm] timer still 00:00 — frozen %.0fs", tick() - State.TimerZeroAt))
                 end
-            elseif TimerText ~= nil then
-                -- timer found and ticking — raid still live
-                State.TimerZeroAt = 0
+            else
+                if State.TimerZeroAt ~= 0 then
+                    print("[RaidFarm] timer cleared (raid ended or counting again)")
+                    State.TimerZeroAt = 0
+                end
             end
-            -- if neither UI exists yet, leave TimerZeroAt alone
         end
     end)
 
