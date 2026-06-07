@@ -554,23 +554,20 @@ do
         end)
     end)
 
-    -- Scan every TextLabel in every ScreenGui every second.
-    -- No hardcoded paths — if anything reads "00:00" while we're in a raid, that's the timer.
-    -- Prints live so you can verify in the executor console.
+    -- Scan descendants of the raid scoreboard GUIs every second for a frozen timer.
+    -- Don't gate on Farm.InRaid() — RaidActive can already be false by the time the
+    -- timer is visibly stuck at 00:00, which is exactly the bug we're trying to catch.
+    -- Substring match (not ==) handles RichText markup / padding around the digits.
     Spawn(function()
         while true do
             Wait(1)
 
-            if not Farm.InRaid() then
-                if State.TimerZeroAt ~= 0 then State.TimerZeroAt = 0 end
-                continue
-            end
-
             local Found = false
-            for _, Gui in ipairs(Client.PlayerGui:GetChildren()) do
-                if not Gui:IsA("ScreenGui") then continue end
+            for _, Name in ipairs({"ClanWarUI", "ChampionshipUI"}) do
+                local Gui = Client.PlayerGui:FindFirstChild(Name)
+                if not Gui then continue end
                 for _, Desc in ipairs(Gui:GetDescendants()) do
-                    if Desc:IsA("TextLabel") and Desc.Text == "00:00" then
+                    if Desc:IsA("TextLabel") and SFind(Desc.Text, "00:00", 1, true) then
                         Found = true
                         break
                     end
@@ -857,7 +854,9 @@ Spawn(function()
 
         -- stuck-raid escape: KillDaCaptain.TimeLeft hit 0 but RaidActive never cleared
         -- if the timer has been at 00:00 for >60s we're in a frozen server
-        local StuckRaid = NowInRaid and State.TimerZeroAt > 0 and (tick() - State.TimerZeroAt) > 60
+        -- don't require NowInRaid here — RaidActive can flip false while the timer
+        -- is still visibly frozen at 00:00, which is the exact bug we're escaping
+        local StuckRaid = State.TimerZeroAt > 0 and (tick() - State.TimerZeroAt) > 60
         if StuckRaid then
             HUD.Status.Text = "Stuck raid — leaving"
             HUD.Phase.Text  = "timer frozen >60s"
@@ -879,8 +878,6 @@ Spawn(function()
             end
             Wait(Config["Rejoin Wait"])
         elseif not NowInRaid then
-            State.DeathCount = 0
-
             local PostRaidWait = 8 - (tick() - State.RaidEndedAt)
             if PostRaidWait > 0 then
                 HUD.Status.Text = Format("Raid ended — waiting %ds", Ceil(PostRaidWait))
