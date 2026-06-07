@@ -554,7 +554,7 @@ do
         end)
     end)
 
-    -- Scan descendants of the raid scoreboard GUIs every second for a frozen timer.
+    -- Scan every descendant of every ScreenGui every second for a frozen timer.
     -- Don't gate on Farm.InRaid() — RaidActive can already be false by the time the
     -- timer is visibly stuck at 00:00, which is exactly the bug we're trying to catch.
     -- Substring match (not ==) handles RichText markup / padding around the digits.
@@ -563,9 +563,8 @@ do
             Wait(1)
 
             local Found = false
-            for _, Name in ipairs({"ClanWarUI", "ChampionshipUI"}) do
-                local Gui = Client.PlayerGui:FindFirstChild(Name)
-                if not Gui then continue end
+            for _, Gui in ipairs(Client.PlayerGui:GetChildren()) do
+                if not Gui:IsA("ScreenGui") then continue end
                 for _, Desc in ipairs(Gui:GetDescendants()) do
                     if Desc:IsA("TextLabel") and SFind(Desc.Text, "00:00", 1, true) then
                         Found = true
@@ -852,17 +851,18 @@ Spawn(function()
         end
         State.WasInRaid = NowInRaid
 
-        -- stuck-raid escape: KillDaCaptain.TimeLeft hit 0 but RaidActive never cleared
-        -- if the timer has been at 00:00 for >60s we're in a frozen server
+        -- stuck-raid escape: timer frozen at 00:00 but the raid never wraps up
+        -- give it a full 3 minutes before bailing — some raids legitimately sit
+        -- on 00:00 for a bit during the boss-kill / results transition
         -- don't require NowInRaid here — RaidActive can flip false while the timer
         -- is still visibly frozen at 00:00, which is the exact bug we're escaping
-        local StuckRaid = State.TimerZeroAt > 0 and (tick() - State.TimerZeroAt) > 60
+        local StuckRaid = State.TimerZeroAt > 0 and (tick() - State.TimerZeroAt) > 180
         if StuckRaid then
             HUD.Status.Text = "Stuck raid — leaving"
-            HUD.Phase.Text  = "timer frozen >60s"
+            HUD.Phase.Text  = "timer frozen >3min"
             Farm.Blacklist(Game.JobId)
             State.TimerZeroAt = 0
-            Farm.Webhook(Format("**Stuck raid** (timer frozen >60s) — bailing | RP: **%d**", Farm.GetRP()))
+            Farm.Webhook(Format("**Stuck raid** (timer frozen >3min) — bailing | RP: **%d**", Farm.GetRP()))
 
             -- try to jump straight into a new raid; fall back to fresh reconnect
             local Escape = Farm.ScanWorlds()
