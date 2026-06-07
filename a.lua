@@ -581,13 +581,11 @@ do
             if Found then
                 if State.TimerZeroAt == 0 then
                     State.TimerZeroAt = tick()
-                    print("[RaidFarm] timer hit 00:00 — stuck check started")
-                else
-                    print(Format("[RaidFarm] timer still 00:00 — frozen %.0fs", tick() - State.TimerZeroAt))
+                    Farm.Webhook("**Timer hit 00:00** — watching for stuck raid")
                 end
             else
                 if State.TimerZeroAt ~= 0 then
-                    print("[RaidFarm] timer cleared (raid ended or counting again)")
+                    Farm.Webhook("**Timer cleared** — raid still moving, stuck check reset")
                     State.TimerZeroAt = 0
                 end
             end
